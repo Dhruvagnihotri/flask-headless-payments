@@ -1,0 +1,75 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "flask-headless-payments"
+version = "0.1.1"
+description = "Modern, headless payment integration for Flask APIs. Stripe subscriptions + webhooks + plan management in one line."
+readme = "README.md"
+authors = [
+    { name = "Dhruv Agnihotri", email = "dagni@umich.edu" }
+]
+license = "MIT"
+requires-python = ">=3.8"
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.8",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Framework :: Flask",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+    "Topic :: Office/Business :: Financial",
+]
+keywords = [
+    "flask",
+    "payments",
+    "stripe",
+    "subscription",
+    "saas",
+    "headless",
+    "api",
+    "billing",
+    "checkout",
+    "webhooks"
+]
+dependencies = [
+    "Flask>=2.0.0",
+    "Flask-SQLAlchemy>=3.0.0",
+    "Flask-JWT-Extended>=4.5.0",
+    "Flask-CORS>=4.0.0",
+    "stripe>=5.0.0",
+    "python-dotenv>=1.0.0",
+    "Werkzeug>=2.0.0",
+    "marshmallow>=3.19.0",
+    "Flask-Migrate>=4.0.0",
+    "redis>=4.0.0",
+    "tenacity>=8.2.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.4.0",
+    "pytest-cov>=4.1.0",
+    "black>=23.7.0",
+    "flake8>=6.1.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/Dhruvagnihotri/flask-headless-payments"
+Repository = "https://github.com/Dhruvagnihotri/flask-headless-payments"
+Issues = "https://github.com/Dhruvagnihotri/flask-headless-payments/issues"
+Documentation = "https://github.com/Dhruvagnihotri/flask-headless-payments#readme"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["flask_headless_payments*"]
+exclude = ["tests*", "examples*"]
+
+[tool.setuptools.package-data]
+flask_headless_payments = ["*.yml", "*.yaml"]
+

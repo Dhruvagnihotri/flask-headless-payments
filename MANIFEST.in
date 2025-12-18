@@ -1,0 +1,6 @@
+include README.md
+include LICENSE
+recursive-include flask_headless_payments *.py
+recursive-include flask_headless_payments *.yml
+recursive-include flask_headless_payments *.yaml
+
