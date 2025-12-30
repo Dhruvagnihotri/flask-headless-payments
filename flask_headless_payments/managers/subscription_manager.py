@@ -132,7 +132,7 @@ class SubscriptionManager:
                     name=name
                 )
                 self.db.session.add(customer)
-                self.db.session.commit()
+                self.db.session.commit()  # Customer creation needs immediate commit for Stripe consistency
                 
                 # Save idempotency result
                 if self.idempotency_manager and idempotency_key:
@@ -284,7 +284,7 @@ class SubscriptionManager:
             raise
     
     @track_operation('update_user_subscription')
-    def update_user_subscription(self, user_id: int, subscription_data: Dict[str, Any]) -> None:
+    def update_user_subscription(self, user_id: int, subscription_data: Dict[str, Any], commit: bool = True) -> None:
         """
         Update user's subscription information.
         
@@ -294,6 +294,9 @@ class SubscriptionManager:
         Args:
             user_id: User ID
             subscription_data: Subscription data from Stripe
+            commit: Whether to commit the transaction (default True).
+                    Set to False when called from webhook handler to allow
+                    batching multiple operations in a single transaction.
             
         Raises:
             SQLAlchemyError: If database operation fails
@@ -327,7 +330,9 @@ class SubscriptionManager:
                 if first_item.get('price') and first_item['price'].get('metadata'):
                     user.plan_name = first_item['price']['metadata'].get('plan_name')
             
-            self.db.session.commit()
+            # Only commit if requested (allows batching in webhook handler)
+            if commit:
+                self.db.session.commit()
             
             # EVENT: subscription.updated
             self.event_manager.publish(
@@ -342,11 +347,13 @@ class SubscriptionManager:
             logger.info(f"Updated subscription for user {user_id}")
             
         except SQLAlchemyError as e:
-            self.db.session.rollback()
+            if commit:
+                self.db.session.rollback()
             logger.error(f"Database error updating subscription: {e}")
             raise
         except Exception as e:
-            self.db.session.rollback()
+            if commit:
+                self.db.session.rollback()
             logger.error(f"Unexpected error updating subscription: {e}")
             raise
     

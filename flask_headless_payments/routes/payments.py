@@ -151,6 +151,115 @@ def create_payment_blueprint(
             logger.error(f"Error creating checkout: {e}")
             return jsonify({'error': 'Failed to create checkout session'}), 500
     
+    @bp.route('/checkout/status', methods=['GET'])
+    @jwt_required()
+    def checkout_status():
+        """
+        Check the status of a checkout/subscription activation.
+        
+        This endpoint is designed to be polled by the frontend after a user
+        completes checkout. It returns the current subscription status and
+        whether the webhook has been processed.
+        
+        Query params:
+            session_id (optional): Stripe checkout session ID to verify
+        
+        Returns:
+            {
+                "status": "pending" | "active" | "trialing" | "canceled" | "failed",
+                "plan": "free" | "basic" | "pro" | etc,
+                "ready": true/false,  # True when subscription is fully activated
+                "message": "Human readable status"
+            }
+        
+        Industry standard pattern:
+        - Frontend polls this after checkout redirect
+        - Returns "pending" until webhook processes
+        - Returns "active"/"trialing" once subscription is confirmed
+        """
+        try:
+            identity = get_jwt_identity()
+            if isinstance(identity, str) and '@' in identity:
+                user = user_model.query.filter_by(email=identity).first()
+            else:
+                user = user_model.query.get(identity)
+            
+            if not user:
+                return jsonify({'error': 'User not found'}), 404
+            
+            session_id = request.args.get('session_id')
+            
+            # Check if we have subscription data
+            has_subscription = (
+                hasattr(user, 'stripe_subscription_id') and 
+                user.stripe_subscription_id is not None
+            )
+            
+            plan_status = getattr(user, 'plan_status', None)
+            plan_name = getattr(user, 'plan_name', 'free') or 'free'
+            
+            # Determine status
+            if plan_status in ['active', 'trialing']:
+                # Check if plan_name has been set by webhook callback
+                # (plan_status gets set first, plan_name gets set by post-commit callback)
+                if plan_name and plan_name != 'free':
+                    # Subscription is confirmed and fully activated
+                    status = plan_status
+                    ready = True
+                    message = f"Your {plan_name} subscription is active"
+                else:
+                    # Subscription is active but business logic hasn't run yet
+                    # (webhook callback hasn't set plan_name)
+                    status = 'processing'
+                    ready = False
+                    message = "Activating your subscription..."
+            elif has_subscription and plan_status:
+                # Has subscription but not fully active yet
+                status = plan_status
+                ready = plan_status not in ['incomplete', 'incomplete_expired', 'past_due']
+                message = f"Subscription status: {plan_status}"
+            elif session_id:
+                # Check if checkout session was completed
+                try:
+                    checkout_session = stripe.checkout.Session.retrieve(session_id)
+                    if checkout_session.status == 'complete':
+                        if checkout_session.subscription:
+                            # Checkout complete but webhook hasn't processed yet
+                            status = 'processing'
+                            ready = False
+                            message = "Payment received, activating subscription..."
+                        else:
+                            status = 'complete'
+                            ready = True
+                            message = "Payment completed"
+                    else:
+                        status = checkout_session.status  # 'open' or 'expired'
+                        ready = False
+                        message = f"Checkout {checkout_session.status}"
+                except stripe.error.StripeError as e:
+                    logger.warning(f"Could not retrieve checkout session: {e}")
+                    status = 'pending'
+                    ready = False
+                    message = "Verifying payment..."
+            else:
+                # No subscription, no session - user is on free plan
+                status = 'none'
+                ready = True
+                message = "No active subscription"
+            
+            return jsonify({
+                'status': status,
+                'plan': plan_name,
+                'plan_status': plan_status,
+                'ready': ready,
+                'message': message,
+                'has_subscription': has_subscription
+            }), 200
+            
+        except Exception as e:
+            logger.error(f"Error checking checkout status: {e}")
+            return jsonify({'error': 'Failed to check status'}), 500
+    
     @bp.route('/portal', methods=['POST'])
     @jwt_required()
     def create_portal():

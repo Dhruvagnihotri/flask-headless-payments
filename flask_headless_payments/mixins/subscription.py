@@ -3,41 +3,72 @@ flask_headless_payments.mixins.subscription
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 Subscription mixin for User model.
+
+Uses SQLAlchemy's declared_attr pattern so columns are automatically
+created when the mixin is inherited - no manual column definition needed.
 """
 
 from datetime import datetime
-from sqlalchemy import inspect
+from sqlalchemy import Column, String, DateTime, Boolean, JSON
+from sqlalchemy.orm import declared_attr
 
 
 class SubscriptionMixin:
     """
     Mixin to add subscription capabilities to User model.
     
-    Add this to your User model to get subscription tracking:
+    Columns are automatically created when you inherit this mixin.
+    No need to manually define subscription columns.
     
     Example:
         class User(db.Model, SubscriptionMixin):
             id = db.Column(db.Integer, primary_key=True)
             email = db.Column(db.String(255), unique=True)
+            # subscription columns are automatically added!
     """
     
-    # Stripe customer fields
-    stripe_customer_id = None  # Will be added as column
+    # Stripe customer fields - using declared_attr for proper column creation
+    @declared_attr
+    def stripe_customer_id(cls):
+        return Column(String(255), unique=True, index=True)
     
-    # Subscription fields
-    stripe_subscription_id = None
-    plan_name = None
-    plan_status = None
-    current_period_start = None
-    current_period_end = None
-    cancel_at_period_end = None
+    @declared_attr
+    def stripe_subscription_id(cls):
+        return Column(String(255), index=True)
+    
+    @declared_attr
+    def plan_name(cls):
+        return Column(String(50), default='free')
+    
+    @declared_attr
+    def plan_status(cls):
+        return Column(String(50), default='active')
+    
+    @declared_attr
+    def current_period_start(cls):
+        return Column(DateTime)
+    
+    @declared_attr
+    def current_period_end(cls):
+        return Column(DateTime)
+    
+    @declared_attr
+    def cancel_at_period_end(cls):
+        return Column(Boolean, default=False)
     
     # Trial fields
-    trial_start = None
-    trial_end = None
+    @declared_attr
+    def trial_start(cls):
+        return Column(DateTime)
+    
+    @declared_attr
+    def trial_end(cls):
+        return Column(DateTime)
     
     # Metadata
-    subscription_metadata = None
+    @declared_attr
+    def subscription_metadata(cls):
+        return Column(JSON)
     
     def is_subscribed(self):
         """Check if user has an active subscription."""

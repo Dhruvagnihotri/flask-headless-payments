@@ -196,42 +196,14 @@ class PaymentSvc:
                    for base in self.user_model.__mro__):
             logger.warning(
                 "User model does not include SubscriptionMixin. "
-                "Subscription fields will be added dynamically."
+                "Please add SubscriptionMixin to your User model for subscription tracking. "
+                "Example: class User(db.Model, SubscriptionMixin): ..."
             )
-            self._add_subscription_fields_to_user(self.user_model)
         
         # Create tables
         with app.app_context():
             self.db.create_all()
             logger.info("Payment database tables created")
-    
-    def _add_subscription_fields_to_user(self, user_model):
-        """Add subscription fields to User model dynamically."""
-        if not hasattr(user_model, 'stripe_customer_id'):
-            user_model.stripe_customer_id = self.db.Column(self.db.String(255), unique=True)
-        if not hasattr(user_model, 'stripe_subscription_id'):
-            user_model.stripe_subscription_id = self.db.Column(self.db.String(255))
-        if not hasattr(user_model, 'plan_name'):
-            user_model.plan_name = self.db.Column(self.db.String(50))
-        if not hasattr(user_model, 'plan_status'):
-            user_model.plan_status = self.db.Column(self.db.String(50))
-        if not hasattr(user_model, 'current_period_start'):
-            user_model.current_period_start = self.db.Column(self.db.DateTime)
-        if not hasattr(user_model, 'current_period_end'):
-            user_model.current_period_end = self.db.Column(self.db.DateTime)
-        if not hasattr(user_model, 'cancel_at_period_end'):
-            user_model.cancel_at_period_end = self.db.Column(self.db.Boolean, default=False)
-        if not hasattr(user_model, 'trial_start'):
-            user_model.trial_start = self.db.Column(self.db.DateTime)
-        if not hasattr(user_model, 'trial_end'):
-            user_model.trial_end = self.db.Column(self.db.DateTime)
-        
-        # Add helper methods from SubscriptionMixin
-        from flask_headless_payments.mixins.subscription import SubscriptionMixin
-        for attr_name in dir(SubscriptionMixin):
-            if not attr_name.startswith('_') and callable(getattr(SubscriptionMixin, attr_name)):
-                if not hasattr(user_model, attr_name):
-                    setattr(user_model, attr_name, getattr(SubscriptionMixin, attr_name))
     
     def _init_stripe(self, app):
         """Initialize Stripe."""

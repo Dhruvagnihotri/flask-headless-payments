@@ -3,7 +3,14 @@ flask_headless_payments.mixins.webhook
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 Webhook event mixin for tracking Stripe webhooks.
+
+Uses SQLAlchemy's declared_attr pattern so columns are automatically
+created when the mixin is inherited.
 """
+
+from datetime import datetime
+from sqlalchemy import Column, String, Integer, DateTime, Boolean, Text, JSON
+from sqlalchemy.orm import declared_attr
 
 
 class WebhookEventMixin:
@@ -11,24 +18,47 @@ class WebhookEventMixin:
     Mixin for WebhookEvent model.
     
     Tracks webhook events from Stripe for debugging and audit.
+    Columns are automatically created when you inherit this mixin.
+    
+    IMPORTANT: The column is named 'data' - if you override, keep this name
+    as the webhook_manager expects it.
     """
     
-    # Core fields
-    id = None
-    stripe_event_id = None
-    event_type = None
+    # Core fields - using declared_attr for proper column creation
+    @declared_attr
+    def stripe_event_id(cls):
+        return Column(String(255), unique=True, nullable=False, index=True)
     
-    # Event data
-    data = None  # JSON field
+    @declared_attr
+    def event_type(cls):
+        return Column(String(100), nullable=False, index=True)
     
-    # Processing
-    processed = None
-    processed_at = None
-    error = None
+    # Event data - MUST be named 'data' for webhook_manager compatibility
+    @declared_attr
+    def data(cls):
+        return Column(JSON, nullable=False)
     
-    # Metadata
-    received_at = None
-    created_at = None
+    # Processing status
+    @declared_attr
+    def processed(cls):
+        return Column(Boolean, default=False, nullable=False, index=True)
+    
+    @declared_attr
+    def processed_at(cls):
+        return Column(DateTime)
+    
+    @declared_attr
+    def error(cls):
+        return Column(Text)
+    
+    # Timestamps
+    @declared_attr
+    def received_at(cls):
+        return Column(DateTime, default=datetime.utcnow, nullable=False)
+    
+    @declared_attr
+    def created_at(cls):
+        return Column(DateTime, default=datetime.utcnow, nullable=False)
     
     def to_dict(self):
         """Convert webhook event to dictionary."""

@@ -3,7 +3,14 @@ flask_headless_payments.mixins.payment
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 Payment mixin for payment records.
+
+Uses SQLAlchemy's declared_attr pattern so columns are automatically
+created when the mixin is inherited.
 """
+
+from datetime import datetime
+from sqlalchemy import Column, String, Integer, DateTime, Text, JSON
+from sqlalchemy.orm import declared_attr
 
 
 class PaymentMixin:
@@ -11,30 +18,64 @@ class PaymentMixin:
     Mixin for Payment model.
     
     Tracks individual payment transactions.
+    Columns are automatically created when you inherit this mixin.
+    
+    Note: You still need to define 'id' as primary key in your model.
     """
     
-    # Core fields
-    id = None
-    stripe_payment_intent_id = None
-    stripe_invoice_id = None
-    user_id = None
+    # Core fields - using declared_attr for proper column creation
+    @declared_attr
+    def stripe_payment_intent_id(cls):
+        return Column(String(255), unique=True, index=True)
+    
+    @declared_attr
+    def stripe_invoice_id(cls):
+        return Column(String(255), index=True)
+    
+    @declared_attr
+    def user_id(cls):
+        return Column(Integer, nullable=False, index=True)
     
     # Amount
-    amount = None
-    currency = None
+    @declared_attr
+    def amount(cls):
+        return Column(Integer, nullable=False)  # in cents
     
-    # Status
-    status = None  # succeeded, pending, failed, canceled, refunded
+    @declared_attr
+    def currency(cls):
+        return Column(String(3), default='usd', nullable=False)
+    
+    # Status: succeeded, pending, failed, canceled, refunded
+    @declared_attr
+    def status(cls):
+        return Column(String(50), nullable=False)
     
     # Payment details
-    payment_method = None
-    receipt_url = None
+    @declared_attr
+    def payment_method(cls):
+        return Column(String(255))
+    
+    @declared_attr
+    def receipt_url(cls):
+        return Column(String(500))
     
     # Metadata
-    description = None
-    metadata = None
-    created_at = None
-    updated_at = None
+    @declared_attr
+    def description(cls):
+        return Column(Text)
+    
+    @declared_attr
+    def payment_metadata(cls):
+        """Named payment_metadata to avoid conflict with SQLAlchemy's metadata."""
+        return Column(JSON)
+    
+    @declared_attr
+    def created_at(cls):
+        return Column(DateTime, default=datetime.utcnow, nullable=False)
+    
+    @declared_attr
+    def updated_at(cls):
+        return Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
     
     def to_dict(self):
         """Convert payment to dictionary."""
