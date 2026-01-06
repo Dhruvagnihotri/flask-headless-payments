@@ -9,6 +9,7 @@ from flask import Blueprint, request, jsonify, current_app
 from flask_jwt_extended import jwt_required, get_jwt_identity
 import stripe
 import logging
+import os
 
 logger = logging.getLogger(__name__)
 
@@ -409,16 +410,22 @@ def create_payment_blueprint(
         
         # Smart fallback chain for webhook secret:
         # 1. Instance-level (for multi-app monorepos): webhook_secret parameter
-        # 2. App-specific env var (optional): STRIPE_WEBHOOK_SECRET_{BLUEPRINT_NAME}
-        # 3. Global env var (single app default): STRIPE_WEBHOOK_SECRET
+        # 2. App-specific env var from config: STRIPE_WEBHOOK_SECRET_{BLUEPRINT_NAME}
+        # 3. App-specific env var directly from environment (fallback if not in config)
+        # 4. Global env var from config: STRIPE_WEBHOOK_SECRET
+        # 5. Global env var directly from environment (fallback if not in config)
+        app_specific_key = f'STRIPE_WEBHOOK_SECRET_{blueprint_name.upper()}'
+        
         secret = (
             webhook_secret or 
-            config.get(f'STRIPE_WEBHOOK_SECRET_{blueprint_name.upper()}') or
-            config.get('STRIPE_WEBHOOK_SECRET')
+            config.get(app_specific_key) or
+            os.environ.get(app_specific_key) or
+            config.get('STRIPE_WEBHOOK_SECRET') or
+            os.environ.get('STRIPE_WEBHOOK_SECRET')
         )
         
         if not secret:
-            logger.error(f"Webhook secret not configured. Tried: webhook_secret param, STRIPE_WEBHOOK_SECRET_{blueprint_name.upper()}, STRIPE_WEBHOOK_SECRET")
+            logger.error(f"Webhook secret not configured. Tried: webhook_secret param, config[{app_specific_key}], os.environ[{app_specific_key}], config[STRIPE_WEBHOOK_SECRET], os.environ[STRIPE_WEBHOOK_SECRET]")
             return jsonify({'error': 'Webhook not configured'}), 500
         
         # Verify webhook signature
