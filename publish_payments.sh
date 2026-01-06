@@ -14,7 +14,7 @@ echo "🚀 Publishing flask-headless-payments to PyPI..."
 echo ""
 
 # Get version from __version__.py
-VERSION=$(python -c "import re; content = open('flask_headless_payments/__version__.py').read(); print(re.search(r'__version__\s*=\s*[\"']([^\"']+)[\"']', content).group(1))")
+VERSION=$(python -c "import re; content = open('flask_headless_payments/__version__.py').read(); match = re.search(r\"__version__\s*=\s*['\\\"]([^'\\\"]+)['\\\"]\", content); print(match.group(1) if match else '0.0.0')")
 echo "📦 Version: $VERSION"
 echo ""
 
@@ -29,7 +29,7 @@ python -c "
 import re
 with open('pyproject.toml', 'r') as f:
     content = f.read()
-content = re.sub(r'(^version = \")[^\"]+', f'\\1${VERSION}', content, flags=re.MULTILINE)
+content = re.sub(r'^version = \"[^\"]+\"', f'version = \"${VERSION}\"', content, flags=re.MULTILINE)
 with open('pyproject.toml', 'w') as f:
     f.write(content)
 "

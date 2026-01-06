@@ -37,6 +37,7 @@ class PaymentSvc:
         plans: Optional[Dict[str, Dict[str, Any]]] = None,
         blueprint_name: str = 'paymentsvc',
         url_prefix: Optional[str] = None,
+        webhook_secret: Optional[str] = None,
         **kwargs
     ):
         """
@@ -52,6 +53,7 @@ class PaymentSvc:
             plans: Plan configuration dictionary
             blueprint_name: Unique name for the blueprint (default: 'paymentsvc')
             url_prefix: URL prefix for routes (default: from config or '/api/payments')
+            webhook_secret: Stripe webhook secret for this instance (for monorepo support)
             **kwargs: Additional configuration options
         """
         self.app = None
@@ -70,6 +72,7 @@ class PaymentSvc:
         # Store blueprint configuration
         self.blueprint_name = blueprint_name
         self.url_prefix = url_prefix
+        self.webhook_secret = webhook_secret
         
         # Managers
         self.subscription_manager = None
@@ -102,12 +105,14 @@ class PaymentSvc:
         if plans:
             self.plans = plans
         
-        # Extract url_prefix and blueprint_name from kwargs if provided
+        # Extract url_prefix, blueprint_name, and webhook_secret from kwargs if provided
         # This allows overriding via init_app for app factory pattern
         if 'url_prefix' in kwargs and not self.url_prefix:
             self.url_prefix = kwargs['url_prefix']
         if 'blueprint_name' in kwargs and self.blueprint_name == 'paymentsvc':
             self.blueprint_name = kwargs['blueprint_name']
+        if 'webhook_secret' in kwargs and not self.webhook_secret:
+            self.webhook_secret = kwargs['webhook_secret']
         
         # Initialize database
         self._init_database(app)
@@ -200,10 +205,94 @@ class PaymentSvc:
                 "Example: class User(db.Model, SubscriptionMixin): ..."
             )
         
+        # Validate custom models have required fields
+        self._validate_models()
+        
         # Create tables
         with app.app_context():
             self.db.create_all()
             logger.info("Payment database tables created")
+    
+    def _validate_models(self):
+        """
+        Validate that custom models have all required fields.
+        
+        This prevents runtime errors when the webhook_manager or other
+        components try to access expected fields.
+        """
+        errors = []
+        warnings = []
+        
+        # Required fields for WebhookEvent model (used by webhook_manager)
+        webhook_required = {
+            'stripe_event_id': 'String - Stripe event ID',
+            'event_type': 'String - Event type (e.g., checkout.session.completed)',
+            'data': 'JSON - Event data payload (MUST be named "data", not "event_data")',
+            'processed': 'Boolean - Whether event has been processed',
+            'error': 'Text - Error message if processing failed',
+        }
+        
+        if self.webhook_event_model:
+            model_columns = {c.name for c in self.webhook_event_model.__table__.columns}
+            for field, description in webhook_required.items():
+                if field not in model_columns:
+                    errors.append(
+                        f"WebhookEvent model missing required field '{field}' ({description})"
+                    )
+        
+        # Required fields for Customer model
+        customer_required = {
+            'stripe_customer_id': 'String - Stripe customer ID',
+            'user_id': 'Integer - Reference to User',
+            'email': 'String - Customer email',
+        }
+        
+        if self.customer_model:
+            model_columns = {c.name for c in self.customer_model.__table__.columns}
+            for field, description in customer_required.items():
+                if field not in model_columns:
+                    errors.append(
+                        f"Customer model missing required field '{field}' ({description})"
+                    )
+        
+        # Required fields for Payment model
+        payment_required = {
+            'user_id': 'Integer - Reference to User',
+            'amount': 'Integer - Amount in cents',
+            'status': 'String - Payment status',
+        }
+        
+        if self.payment_model:
+            model_columns = {c.name for c in self.payment_model.__table__.columns}
+            for field, description in payment_required.items():
+                if field not in model_columns:
+                    warnings.append(
+                        f"Payment model missing field '{field}' ({description})"
+                    )
+        
+        # Log errors and warnings
+        for warning in warnings:
+            logger.warning(f"⚠️ {warning}")
+        
+        for error in errors:
+            logger.error(f"❌ {error}")
+        
+        if errors:
+            logger.error(
+                "\n" + "="*60 + "\n"
+                "FLASK-HEADLESS-PAYMENTS MODEL VALIDATION FAILED\n"
+                "="*60 + "\n"
+                "Your custom models are missing required fields.\n\n"
+                "SOLUTION: Either:\n"
+                "1. Inherit from the mixins (they auto-create columns):\n"
+                "   class MyWebhookEvent(db.Model, WebhookEventMixin):\n"
+                "       __tablename__ = 'my_webhook_events'\n"
+                "       id = db.Column(db.Integer, primary_key=True)\n"
+                "       # Mixin adds: data, processed, error, etc.\n\n"
+                "2. Or don't pass custom models (use package defaults):\n"
+                "   PaymentSvc(app, user_model=User)  # Uses default tables\n"
+                "="*60
+            )
     
     def _init_stripe(self, app):
         """Initialize Stripe."""
@@ -274,7 +363,7 @@ class PaymentSvc:
         # Use provided url_prefix or fall back to config or default
         url_prefix = self.url_prefix or app.config.get('PAYMENTSVC_URL_PREFIX', '/api/payments')
         
-        # Create payment blueprint with unique name
+        # Create payment blueprint with unique name and instance-level webhook secret
         payment_bp = create_payment_blueprint(
             user_model=self.user_model,
             customer_model=self.customer_model,
@@ -285,7 +374,8 @@ class PaymentSvc:
             webhook_manager=self.webhook_manager,
             plan_manager=self.plan_manager,
             config=app.config,
-            blueprint_name=self.blueprint_name  # Pass unique blueprint name
+            blueprint_name=self.blueprint_name,  # Pass unique blueprint name
+            webhook_secret=self.webhook_secret  # Pass instance-level webhook secret
         )
         
         app.register_blueprint(payment_bp, url_prefix=url_prefix)

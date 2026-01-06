@@ -23,7 +23,8 @@ def create_payment_blueprint(
     webhook_manager,
     plan_manager,
     config,
-    blueprint_name='paymentsvc'
+    blueprint_name='paymentsvc',
+    webhook_secret=None
 ):
     """
     Create payment blueprint with all routes.
@@ -131,12 +132,22 @@ def create_payment_blueprint(
             # Get trial days
             trial_days = data.get('trial_days') or config.get('PAYMENTSVC_DEFAULT_TRIAL_DAYS')
             
+            # Get custom URLs from request (frontend controls redirect URLs)
+            success_url = data.get('success_url')
+            cancel_url = data.get('cancel_url')
+            
+            # Debug: Log what URLs we received
+            logger.info(f"Checkout request - success_url: {success_url}, cancel_url: {cancel_url}")
+            logger.info(f"Checkout request - full data: {data}")
+            
             # Create checkout session
             session = checkout_manager.create_checkout_session(
                 customer_id=customer_id,
                 price_id=price_id,
                 trial_days=trial_days,
-                metadata={'user_id': user.id, 'plan_name': plan_name}
+                metadata={'user_id': user.id, 'plan_name': plan_name},
+                success_url=success_url,
+                cancel_url=cancel_url
             )
             
             return jsonify({
@@ -395,14 +406,23 @@ def create_payment_blueprint(
         """Handle Stripe webhook events."""
         payload = request.data
         sig_header = request.headers.get('Stripe-Signature')
-        webhook_secret = config.get('STRIPE_WEBHOOK_SECRET')
         
-        if not webhook_secret:
-            logger.error("STRIPE_WEBHOOK_SECRET not configured")
+        # Smart fallback chain for webhook secret:
+        # 1. Instance-level (for multi-app monorepos): webhook_secret parameter
+        # 2. App-specific env var (optional): STRIPE_WEBHOOK_SECRET_{BLUEPRINT_NAME}
+        # 3. Global env var (single app default): STRIPE_WEBHOOK_SECRET
+        secret = (
+            webhook_secret or 
+            config.get(f'STRIPE_WEBHOOK_SECRET_{blueprint_name.upper()}') or
+            config.get('STRIPE_WEBHOOK_SECRET')
+        )
+        
+        if not secret:
+            logger.error(f"Webhook secret not configured. Tried: webhook_secret param, STRIPE_WEBHOOK_SECRET_{blueprint_name.upper()}, STRIPE_WEBHOOK_SECRET")
             return jsonify({'error': 'Webhook not configured'}), 500
         
         # Verify webhook signature
-        event = webhook_manager.verify_webhook(payload, sig_header, webhook_secret)
+        event = webhook_manager.verify_webhook(payload, sig_header, secret)
         
         if not event:
             return jsonify({'error': 'Invalid signature'}), 400

@@ -52,11 +52,18 @@ class CheckoutManager:
             dict: Checkout session object
         """
         try:
+            # Ensure success_url always includes session_id placeholder
+            final_success_url = success_url or self.success_url
+            if '?' in final_success_url:
+                final_success_url += '&session_id={CHECKOUT_SESSION_ID}'
+            else:
+                final_success_url += '?session_id={CHECKOUT_SESSION_ID}'
+            
             session_params = {
                 'customer': customer_id,
                 'mode': mode,
                 'line_items': [{'price': price_id, 'quantity': 1}],
-                'success_url': success_url or self.success_url + '?session_id={CHECKOUT_SESSION_ID}',
+                'success_url': final_success_url,
                 'cancel_url': cancel_url or self.cancel_url,
             }
             

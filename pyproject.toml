@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "flask-headless-payments"
-version = "0.1.1"
+version = "0.2.4"
 description = "Modern, headless payment integration for Flask APIs. Stripe subscriptions + webhooks + plan management in one line."
 readme = "README.md"
 authors = [
