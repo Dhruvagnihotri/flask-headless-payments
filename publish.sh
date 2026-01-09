@@ -7,8 +7,44 @@ set -e
 echo "🚀 Publishing flask-headless-payments to PyPI..."
 echo ""
 
-# Get version from __version__.py
-VERSION=$(python -c "import re; content = open('flask_headless_payments/__version__.py').read(); print(re.search(r'__version__\s*=\s*[\"']([^\"']+)[\"']', content).group(1))")
+# Auto-increment version
+echo "📈 Auto-incrementing version..."
+python -c "
+import re
+
+# Read current version
+with open('flask_headless_payments/__version__.py', 'r') as f:
+    content = f.read()
+    match = re.search(r'__version__\s*=\s*[\\\"\\']([^\\\"\\']+)[\\\"\\']', content)
+    current_version = match.group(1) if match else '0.0.0'
+
+# Parse version (major.minor.patch)
+parts = current_version.split('.')
+if len(parts) == 3:
+    major, minor, patch = parts
+    # Increment patch version
+    new_patch = int(patch) + 1
+    new_version = f'{major}.{minor}.{new_patch}'
+else:
+    # Fallback: just append .1
+    new_version = current_version + '.1'
+
+print(f'Current: {current_version} -> New: {new_version}')
+
+# Update __version__.py
+updated_content = re.sub(
+    r'__version__\s*=\s*[\\\"\\'][^\\\"\\']+[\\\"\\']',
+    f'__version__ = \\\"{new_version}\\\"',
+    content
+)
+with open('flask_headless_payments/__version__.py', 'w') as f:
+    f.write(updated_content)
+
+print(f'✅ Version updated to {new_version}')
+"
+
+# Get new version from __version__.py
+VERSION=$(python -c "import re; content = open('flask_headless_payments/__version__.py').read(); print(re.search(r'__version__\s*=\s*[\\\"\\']([^\\\"\\']+)[\\\"\\']', content).group(1))")
 echo "📦 Version: $VERSION"
 echo ""
 

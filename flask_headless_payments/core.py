@@ -149,7 +149,8 @@ class PaymentSvc:
         if not stripe_key:
             logger.warning("STRIPE_API_KEY not configured - payment functionality will not work")
         
-        webhook_secret = app.config.get('STRIPE_WEBHOOK_SECRET')
+        webhook_secret = (app.config.get(f'STRIPE_WEBHOOK_SECRET_{self.blueprint_name.upper()}') or 
+                          app.config.get('STRIPE_WEBHOOK_SECRET'))
         if not webhook_secret:
             logger.warning("STRIPE_WEBHOOK_SECRET not configured - webhooks will not work")
     
