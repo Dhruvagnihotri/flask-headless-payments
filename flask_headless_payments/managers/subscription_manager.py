@@ -324,11 +324,14 @@ class SubscriptionManager:
             if subscription_data.get('trial_end'):
                 user.trial_end = datetime.fromtimestamp(subscription_data['trial_end'])
             
-            # Extract plan name from metadata or items
+            # Extract plan name from Stripe price metadata (if set)
+            # Only overwrite if the metadata actually contains a non-empty plan_name
             if subscription_data.get('items') and subscription_data['items'].get('data'):
                 first_item = subscription_data['items']['data'][0]
-                if first_item.get('price') and first_item['price'].get('metadata'):
-                    user.plan_name = first_item['price']['metadata'].get('plan_name')
+                price_meta = (first_item.get('price') or {}).get('metadata') or {}
+                meta_plan = price_meta.get('plan_name')
+                if meta_plan:
+                    user.plan_name = meta_plan
             
             # Only commit if requested (allows batching in webhook handler)
             if commit:
