@@ -123,16 +123,55 @@ class WebhookManager:
         event_type = event['type']
         event_data = event['data']['object']
         affected_user = None  # Track user for post-commit callbacks
-        
+
+        # Idempotency: Stripe redelivers events on transient handler
+        # failures (e.g. our DB blip, our 5xx response). The unique
+        # constraint on stripe_event_id would catch a true double-process
+        # on commit, but by then we'd have re-run handlers, made
+        # outbound Stripe API calls, and re-fired post-commit callbacks
+        # (which DO write to the DB outside this transaction and would
+        # double-count). We need a race-safe claim: SELECT ... FOR
+        # UPDATE on the existing row blocks concurrent retries on the
+        # same event_id while we decide whether to proceed.
+        existing = self.webhook_event_model.query.filter_by(
+            stripe_event_id=event['id']
+        ).with_for_update().first()
+        if existing is not None:
+            if existing.processed:
+                # Another worker won. Release the row lock by committing
+                # the (empty) transaction and short-circuit.
+                self.db.session.commit()
+                logger.info(
+                    f"Skipping duplicate webhook event {event['id']} "
+                    f"({event_type}) — already processed at {existing.processed_at}"
+                )
+                return True
+            # Previously errored OR concurrent retry. We hold the row
+            # lock, so any other worker on the same event_id will block
+            # until our transaction commits or rolls back. That worker
+            # will then re-read with processed=True and short-circuit.
+            logger.warning(
+                f"Re-processing previously failed webhook event {event['id']} ({event_type})"
+            )
+
         try:
             # Create webhook event record (will be committed with everything else)
-            webhook_event = self.webhook_event_model(
-                stripe_event_id=event['id'],
-                event_type=event_type,
-                data=event_data,
-                received_at=datetime.utcnow()
-            )
-            self.db.session.add(webhook_event)
+            if existing is None:
+                webhook_event = self.webhook_event_model(
+                    stripe_event_id=event['id'],
+                    event_type=event_type,
+                    data=event_data,
+                    received_at=datetime.utcnow()
+                )
+                self.db.session.add(webhook_event)
+            else:
+                # Reuse the row from the prior failed attempt. Refresh
+                # event_type and data in case Stripe re-delivers a
+                # corrected payload (rare but documented behavior).
+                webhook_event = existing
+                webhook_event.event_type = event_type
+                webhook_event.data = event_data
+                webhook_event.error = None  # clear stale error from prior attempt
             
             # Process the event - handlers should NOT commit
             if event_type in self.event_handlers:
@@ -186,22 +225,48 @@ class WebhookManager:
     def _log_webhook_error(self, event_id: str, event_type: str, event_data: Dict[str, Any], error: str):
         """
         Log webhook error in a separate transaction.
-        
+
         This ensures error logging doesn't fail due to the rolled-back transaction.
+        Upsert-shaped: if the row already exists (e.g. this is a Stripe
+        retry of a previously-errored event), update the existing row
+        instead of inserting a duplicate that would violate the
+        stripe_event_id unique constraint.
         """
         try:
-            webhook_event = self.webhook_event_model(
-                stripe_event_id=event_id,
-                event_type=event_type,
-                data=event_data,
-                received_at=datetime.utcnow(),
-                processed=False,
-                error=error
-            )
-            self.db.session.add(webhook_event)
+            # Lock the row before reading state. Without FOR UPDATE the
+            # check-then-write window lets a successful worker commit
+            # processed=True between our read and our update — we'd
+            # then overwrite the successful row with this error and
+            # flip processed back to False. With FOR UPDATE we block
+            # the success path's commit (or it blocks ours) so the
+            # `if existing.processed` guard is safe.
+            existing = self.webhook_event_model.query.filter_by(
+                stripe_event_id=event_id
+            ).with_for_update().first()
+            if existing is not None:
+                if existing.processed:
+                    logger.info(
+                        f"Skipping error-log upsert for event {event_id}: "
+                        f"another worker already processed it successfully"
+                    )
+                    self.db.session.commit()
+                    return
+                existing.error = error
+                existing.processed = False
+            else:
+                webhook_event = self.webhook_event_model(
+                    stripe_event_id=event_id,
+                    event_type=event_type,
+                    data=event_data,
+                    received_at=datetime.utcnow(),
+                    processed=False,
+                    error=error
+                )
+                self.db.session.add(webhook_event)
             self.db.session.commit()
         except Exception as log_error:
             logger.error(f"Failed to log webhook error: {log_error}")
+            self.db.session.rollback()
     
     def _handle_default_event(self, event_type: str, event_data: Dict[str, Any], commit: bool = False) -> Optional[Any]:
         """
@@ -306,23 +371,31 @@ class WebhookManager:
     def _handle_subscription_deleted(self, subscription: Dict[str, Any], commit: bool = False) -> Optional[Any]:
         """
         Handle customer.subscription.deleted event.
-        
+
         Args:
             commit: Whether to commit (False when part of larger transaction)
-            
+
         Returns:
             User object if found
         """
         customer_id = subscription.get('customer')
-        
+
         # Find user by customer ID
         user = self.user_model.query.filter_by(stripe_customer_id=customer_id).first()
         if user:
+            # Stash the pre-cancel plan_status as a transient attribute so
+            # post-commit callbacks can classify churn (trial vs paid)
+            # accurately. We mutate user.plan_status to 'canceled' below;
+            # by the time the callback runs, that mutation is committed
+            # and the original signal is gone. SQLAlchemy ignores
+            # underscore-prefixed attributes for ORM persistence so this
+            # rides along on the in-memory object only.
+            user._prev_plan_status = user.plan_status
             user.plan_status = 'canceled'
             user.stripe_subscription_id = None
             if commit:
                 self.db.session.commit()
-        
+
         return user
     
     def _handle_invoice_paid(self, invoice: Dict[str, Any], commit: bool = False) -> Optional[Any]:

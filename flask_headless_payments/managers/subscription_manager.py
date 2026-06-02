@@ -9,9 +9,25 @@ This is THE subscription manager - production-ready with hooks and events.
 
 import stripe
 import logging
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Optional, Dict, Any
 from sqlalchemy.exc import SQLAlchemyError
+
+
+def _from_stripe_ts(ts):
+    """
+    Convert a Stripe Unix timestamp to a naive UTC datetime.
+
+    Stripe always sends timestamps in UTC. `datetime.fromtimestamp(ts)`
+    (no tz) returns local time, which silently drifts when the server
+    runs in a non-UTC timezone — period boundaries flip a day, trial_end
+    appears in the past, etc. We convert via UTC and then strip tzinfo
+    to keep the column type compatible with existing naive-DateTime
+    schemas (the value itself is now UTC).
+    """
+    if ts is None:
+        return None
+    return datetime.fromtimestamp(ts, tz=timezone.utc).replace(tzinfo=None)
 
 from flask_headless_payments.utils.retry import retry_with_backoff, with_circuit_breaker
 from flask_headless_payments.utils.monitoring import track_operation
@@ -174,7 +190,15 @@ class SubscriptionManager:
                 )
                 
                 logger.error(f"Database error creating customer: {e}")
-                logger.error(f"CLEANUP REQUIRED: Stripe customer {stripe_customer.id} created but DB save failed")
+                # Self-healing: callers pass an idempotency_key, so a
+                # retry of the same /checkout request will replay
+                # Stripe's cached Customer response (same customer.id)
+                # and we'll bind it to our DB on the second attempt.
+                # No manual cleanup required as long as the caller retries.
+                logger.warning(
+                    f"Stripe customer {stripe_customer.id} created but DB save failed — "
+                    f"will be re-bound on next retry via idempotency key"
+                )
                 raise
             
         except stripe.error.StripeError as e:
@@ -312,17 +336,18 @@ class SubscriptionManager:
             user.plan_status = subscription_data.get('status')
             user.cancel_at_period_end = subscription_data.get('cancel_at_period_end', False)
             
-            # Update period dates
+            # Update period dates (Stripe sends UTC seconds; convert via UTC
+            # so non-UTC servers don't drift the boundary).
             if subscription_data.get('current_period_start'):
-                user.current_period_start = datetime.fromtimestamp(subscription_data['current_period_start'])
+                user.current_period_start = _from_stripe_ts(subscription_data['current_period_start'])
             if subscription_data.get('current_period_end'):
-                user.current_period_end = datetime.fromtimestamp(subscription_data['current_period_end'])
-            
+                user.current_period_end = _from_stripe_ts(subscription_data['current_period_end'])
+
             # Update trial dates
             if subscription_data.get('trial_start'):
-                user.trial_start = datetime.fromtimestamp(subscription_data['trial_start'])
+                user.trial_start = _from_stripe_ts(subscription_data['trial_start'])
             if subscription_data.get('trial_end'):
-                user.trial_end = datetime.fromtimestamp(subscription_data['trial_end'])
+                user.trial_end = _from_stripe_ts(subscription_data['trial_end'])
             
             # Extract plan name from Stripe price metadata (if set)
             # Only overwrite if the metadata actually contains a non-empty plan_name

@@ -7,11 +7,28 @@ Payment API routes.
 
 from flask import Blueprint, request, jsonify, current_app
 from flask_jwt_extended import jwt_required, get_jwt_identity
+import hashlib
 import stripe
 import logging
 import os
 
 logger = logging.getLogger(__name__)
+
+
+def _build_idempotency_key(action: str, user_id, *parts) -> str:
+    """
+    Deterministic Stripe idempotency key for state-changing user actions.
+
+    Stripe replays identical (key, params) within 24h as a cached response,
+    which dedupes accidental double-clicks (and accidental concurrent
+    submits) without us tracking the request server-side. The key MUST be
+    unique per logical operation: a cancel and a re-cancel after period
+    extension should not share a key, so we mix in the operation-specific
+    state (e.g. the target subscription_id and cancel flag).
+    """
+    raw = '|'.join([action, str(user_id), *(str(p) for p in parts)])
+    digest = hashlib.sha256(raw.encode()).hexdigest()[:32]
+    return f"paymentsvc_{action}_{digest}"
 
 
 def create_payment_blueprint(
@@ -116,39 +133,48 @@ def create_payment_blueprint(
             if not price_id:
                 return jsonify({'error': 'Plan has no price ID'}), 400
             
-            # Get or create Stripe customer
+            # Get or create Stripe customer. Idempotency key is per-user,
+            # so a double-click on Pro doesn't create two Stripe customers
+            # for the same account.
             customer_id = subscription_manager.get_or_create_customer(
                 user_id=user.id,
                 email=user.email,
-                name=getattr(user, 'first_name', None)
+                name=getattr(user, 'first_name', None),
+                idempotency_key=_build_idempotency_key('customer', user.id, user.email),
             )
-            
+
             # Update user with customer ID if not set
             if not hasattr(user, 'stripe_customer_id') or not user.stripe_customer_id:
                 user.stripe_customer_id = customer_id
                 from flask_headless_payments.extensions import get_db
                 db = get_db()
                 db.session.commit()
-            
+
             # Get trial days
             trial_days = data.get('trial_days') or config.get('PAYMENTSVC_DEFAULT_TRIAL_DAYS')
-            
+
             # Get custom URLs from request (frontend controls redirect URLs)
             success_url = data.get('success_url')
             cancel_url = data.get('cancel_url')
-            
+
             # Debug: Log what URLs we received
             logger.info(f"Checkout request - success_url: {success_url}, cancel_url: {cancel_url}")
             logger.info(f"Checkout request - full data: {data}")
-            
-            # Create checkout session
+
+            # Create checkout session. Key mixes user, plan, and
+            # trial_days so a re-attempt with a different plan or after a
+            # trial-policy change yields a new session, but a true
+            # double-click reuses the cached one.
             session = checkout_manager.create_checkout_session(
                 customer_id=customer_id,
                 price_id=price_id,
                 trial_days=trial_days,
                 metadata={'user_id': user.id, 'plan_name': plan_name},
                 success_url=success_url,
-                cancel_url=cancel_url
+                cancel_url=cancel_url,
+                idempotency_key=_build_idempotency_key(
+                    'checkout', user.id, plan_name, price_id, trial_days or 0
+                ),
             )
             
             return jsonify({
@@ -234,6 +260,21 @@ def create_payment_blueprint(
                 # Check if checkout session was completed
                 try:
                     checkout_session = stripe.checkout.Session.retrieve(session_id)
+                    # Authorization: the session_id is in the URL after the
+                    # Stripe redirect. Without an ownership check, any
+                    # authenticated user who learns a session_id can probe
+                    # another user's payment state. session.customer is
+                    # set as soon as the session is created from our
+                    # /checkout endpoint, so it's safe to compare.
+                    session_customer = getattr(checkout_session, 'customer', None)
+                    user_customer = getattr(user, 'stripe_customer_id', None)
+                    if session_customer and user_customer and session_customer != user_customer:
+                        logger.warning(
+                            f"Session ownership mismatch: user={user.id} "
+                            f"customer={user_customer} session.customer={session_customer}"
+                        )
+                        return jsonify({'error': 'Session does not belong to current user'}), 403
+
                     if checkout_session.status == 'complete':
                         if checkout_session.subscription:
                             # Checkout complete but webhook hasn't processed yet
@@ -326,10 +367,15 @@ def create_payment_blueprint(
             data = request.get_json() or {}
             at_period_end = data.get('at_period_end', True)
             
-            # Cancel subscription
+            # Cancel subscription. Idempotency key dedupes double-clicks:
+            # (user, subscription, mode) — re-cancelling with a different
+            # `at_period_end` yields a different key so it isn't cached.
             subscription = subscription_manager.cancel_subscription(
                 subscription_id=user.stripe_subscription_id,
-                at_period_end=at_period_end
+                at_period_end=at_period_end,
+                idempotency_key=_build_idempotency_key(
+                    'cancel', user.id, user.stripe_subscription_id, at_period_end
+                ),
             )
             
             # Update user
@@ -380,10 +426,15 @@ def create_payment_blueprint(
             if not new_price_id:
                 return jsonify({'error': 'Plan has no price ID'}), 400
             
-            # Update subscription
+            # Update subscription. Key includes target price so an upgrade
+            # from pro→business and a later downgrade business→pro have
+            # distinct keys.
             subscription = subscription_manager.update_subscription(
                 subscription_id=user.stripe_subscription_id,
-                new_price_id=new_price_id
+                new_price_id=new_price_id,
+                idempotency_key=_build_idempotency_key(
+                    'upgrade', user.id, user.stripe_subscription_id, new_price_id
+                ),
             )
             
             # Update user with new plan info

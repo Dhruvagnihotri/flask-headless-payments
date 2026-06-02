@@ -35,10 +35,11 @@ class CheckoutManager:
         metadata: Optional[Dict] = None,
         success_url: Optional[str] = None,
         cancel_url: Optional[str] = None,
+        idempotency_key: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
         Create a Stripe Checkout session.
-        
+
         Args:
             customer_id: Stripe customer ID
             price_id: Stripe price ID
@@ -47,7 +48,10 @@ class CheckoutManager:
             metadata: Additional metadata (optional)
             success_url: Custom success URL (optional)
             cancel_url: Custom cancel URL (optional)
-            
+            idempotency_key: Stripe idempotency key — dedupes accidental
+                double-clicks within 24h so a single button mash creates
+                one Checkout Session, not two.
+
         Returns:
             dict: Checkout session object
         """
@@ -58,7 +62,7 @@ class CheckoutManager:
                 final_success_url += '&session_id={CHECKOUT_SESSION_ID}'
             else:
                 final_success_url += '?session_id={CHECKOUT_SESSION_ID}'
-            
+
             session_params = {
                 'customer': customer_id,
                 'mode': mode,
@@ -66,23 +70,27 @@ class CheckoutManager:
                 'success_url': final_success_url,
                 'cancel_url': cancel_url or self.cancel_url,
             }
-            
+
             if mode == 'subscription' and trial_days:
                 session_params['subscription_data'] = {
                     'trial_period_days': trial_days
                 }
-            
+
             if metadata:
                 session_params['metadata'] = metadata
                 if mode == 'subscription':
                     session_params['subscription_data'] = session_params.get('subscription_data', {})
                     session_params['subscription_data']['metadata'] = metadata
-            
-            session = stripe.checkout.Session.create(**session_params)
-            
+
+            create_kwargs = {}
+            if idempotency_key:
+                create_kwargs['idempotency_key'] = idempotency_key
+
+            session = stripe.checkout.Session.create(**session_params, **create_kwargs)
+
             logger.info(f"Created checkout session {session.id} for customer {customer_id}")
             return session
-            
+
         except stripe.error.StripeError as e:
             logger.error(f"Failed to create checkout session: {e}")
             raise
