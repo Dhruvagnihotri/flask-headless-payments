@@ -161,10 +161,15 @@ def create_payment_blueprint(
             logger.info(f"Checkout request - success_url: {success_url}, cancel_url: {cancel_url}")
             logger.info(f"Checkout request - full data: {data}")
 
-            # Create checkout session. Key mixes user, plan, and
-            # trial_days so a re-attempt with a different plan or after a
-            # trial-policy change yields a new session, but a true
-            # double-click reuses the cached one.
+            # Create checkout session. We deliberately do NOT send a
+            # Stripe idempotency_key here. The session-determining params
+            # (success_url, cancel_url) vary across pages that link to
+            # checkout (e.g. /pricing vs settings), and Stripe rejects
+            # the same key with different params for 24h. A spurious
+            # double-click at worst creates an extra unused Session URL,
+            # which is free — the user only ever lands on the URL the
+            # frontend actually redirects them to. Customer dedupe (the
+            # call above) is the load-bearing idempotency.
             session = checkout_manager.create_checkout_session(
                 customer_id=customer_id,
                 price_id=price_id,
@@ -172,9 +177,6 @@ def create_payment_blueprint(
                 metadata={'user_id': user.id, 'plan_name': plan_name},
                 success_url=success_url,
                 cancel_url=cancel_url,
-                idempotency_key=_build_idempotency_key(
-                    'checkout', user.id, plan_name, price_id, trial_days or 0
-                ),
             )
             
             return jsonify({
