@@ -6,11 +6,53 @@ Webhook event handling.
 """
 
 import stripe
+import time
 import logging
 from datetime import datetime
+from decimal import Decimal
 from typing import Dict, Any, Callable, Optional
+from sqlalchemy.exc import OperationalError
 
 logger = logging.getLogger(__name__)
+
+
+def _json_safe(obj):
+    """Recursively replace any Decimal in a (possibly nested) dict/list
+    with str. Newer stripe-python parses some `*_decimal` fields (e.g.
+    quantity_decimal on subscription items) as decimal.Decimal for
+    precision — that's not JSON-serializable, so it still breaks the
+    JSON-column insert even after `.to_dict()` (confirmed in production
+    2026-09-06: "Object of type Decimal is not JSON serializable", on
+    invoice.payment_succeeded / customer.subscription.created specifically).
+    str() keeps the exact value (no float rounding); good enough for a
+    stored audit column that's never used for arithmetic.
+    """
+    if isinstance(obj, Decimal):
+        return str(obj)
+    if isinstance(obj, dict):
+        return {k: _json_safe(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_json_safe(v) for v in obj]
+    return obj
+
+
+def _as_plain_dict(obj):
+    """Normalize a Stripe API object to a plain, JSON-serializable dict.
+
+    stripe-python's Event/Session/Subscription/Invoice objects are
+    StripeObject instances, not dicts. Newer stripe-python releases
+    dropped StripeObject's dict-compatible `.get()` (confirmed in
+    production 2026-09-06 — every webhook delivery 500'd with "'get' is
+    a dict method, but a Session is not a dict"), and a raw StripeObject
+    also isn't JSON-serializable for storage in a JSON column. `.to_dict()`
+    recursively converts nested StripeObjects/ListObjects too, so this is
+    safe to call once at the boundary rather than patching every `.get()`
+    call site. Left as a no-op for callers that already pass a plain dict
+    (e.g. tests). Then run through _json_safe for the Decimal case above.
+    """
+    if hasattr(obj, 'to_dict'):
+        obj = obj.to_dict()
+    return _json_safe(obj)
 
 
 class WebhookManager:
@@ -100,28 +142,73 @@ class WebhookManager:
         self.post_commit_callbacks[event_type].append(callback)
         logger.info(f"Registered post-commit callback for {event_type}")
     
-    def process_event(self, event: Dict[str, Any]) -> bool:
+    def process_event(self, event: Dict[str, Any], _max_deadlock_retries: int = 3) -> bool:
         """
-        Process a webhook event in a single transaction.
-        
+        Process a webhook event, retrying on MySQL deadlock.
+
+        The SELECT ... FOR UPDATE idempotency claim below (see
+        _process_event_once) can deadlock under real concurrent access —
+        confirmed while load-testing locally 2026-09-07: Stripe routinely
+        fires 4-6 events within seconds of a single checkout completing
+        (checkout.session.completed, customer.subscription.created,
+        invoice.*, billing_portal.*), and near-simultaneous INSERTs
+        against stripe_event_id's unique index hit InnoDB gap-lock
+        contention. Without this retry, every such burst 500s on first
+        attempt and only succeeds because Stripe happens to redeliver on
+        failure — real behavior, but relying on Stripe's retry timing as
+        the only safety net is fragile, not a fix. Production runs a
+        single sync gunicorn worker today (no true request concurrency),
+        so this is a latent risk rather than a confirmed prod failure —
+        closing it now is cheap and removes the dependency on Stripe's
+        retry behavior either way.
+        """
+        for attempt in range(_max_deadlock_retries):
+            try:
+                return self._process_event_once(event)
+            except OperationalError as e:
+                is_deadlock = '1213' in str(e) or 'Deadlock' in str(e)
+                self.db.session.rollback()
+                if not is_deadlock or attempt == _max_deadlock_retries - 1:
+                    logger.error(
+                        f"Failed to process event {event['id']} after "
+                        f"{attempt + 1} attempt(s): {e}"
+                    )
+                    self._log_webhook_error(
+                        event['id'], event['type'],
+                        _as_plain_dict(event['data']['object']), str(e),
+                    )
+                    return False
+                logger.warning(
+                    f"Deadlock processing event {event['id']}, "
+                    f"retrying (attempt {attempt + 2}/{_max_deadlock_retries})"
+                )
+                time.sleep(0.1 * (attempt + 1))
+        return False
+
+    def _process_event_once(self, event: Dict[str, Any]) -> bool:
+        """
+        Process a webhook event in a single transaction. One attempt —
+        see process_event() above for the deadlock-retry wrapper callers
+        should actually use.
+
         Transaction behavior:
         - All database operations happen in ONE transaction
         - On success: single commit at the end
         - On failure: full rollback, then error is logged separately
-        
+
         Post-commit callbacks:
         - Run AFTER successful commit
         - Failures in callbacks don't affect the webhook processing
         - Each callback gets its own transaction for any DB operations
-        
+
         Args:
             event: Stripe event object
-            
+
         Returns:
             bool: True if processed successfully, False otherwise
         """
         event_type = event['type']
-        event_data = event['data']['object']
+        event_data = _as_plain_dict(event['data']['object'])
         affected_user = None  # Track user for post-commit callbacks
 
         # Idempotency: Stripe redelivers events on transient handler
@@ -194,16 +281,25 @@ class WebhookManager:
             self._run_post_commit_callbacks(event_type, event_data, affected_user)
             
             return True
-            
-        except Exception as e:
-            # Full rollback on any error
+
+        except OperationalError:
+            # Re-raise deadlocks (and any other OperationalError) so
+            # process_event()'s wrapper can retry — rollback here so the
+            # retry starts from a clean session, but don't log/swallow
+            # it yet; the wrapper decides whether this was the last
+            # attempt and only logs then.
             self.db.session.rollback()
-            
+            raise
+
+        except Exception as e:
+            # Full rollback on any other error
+            self.db.session.rollback()
+
             logger.error(f"Failed to process event {event['id']}: {e}")
-            
+
             # Log the error in a separate transaction
             self._log_webhook_error(event['id'], event_type, event_data, str(e))
-            
+
             return False
     
     def _run_post_commit_callbacks(self, event_type: str, event_data: Dict[str, Any], user: Any):

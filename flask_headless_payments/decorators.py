@@ -13,6 +13,25 @@ import logging
 logger = logging.getLogger(__name__)
 
 
+def _resolve_user(user_model, identity):
+    """Resolve a User row from a JWT identity that may be a primary-key
+    id OR an email string.
+
+    `query.get(identity)` assumes identity is the primary key — true for
+    some flask-jwt-extended setups, but this library is also used by apps
+    (confirmed: pdfwhiz/pdfcourt) whose JWT identity is the user's email.
+    query.get() on an email string either raises or silently returns None
+    depending on backend/column types, so these decorators would 403/404
+    every request rather than gate correctly. routes/payments.py already
+    has to special-case this per-route; centralizing it here means any
+    app using these decorators gets the right behavior automatically
+    instead of rediscovering the same bug.
+    """
+    if isinstance(identity, str) and '@' in identity:
+        return user_model.query.filter_by(email=identity).first()
+    return user_model.query.get(identity)
+
+
 def requires_plan(*allowed_plans):
     """
     Decorator to require specific subscription plan(s).
@@ -43,7 +62,7 @@ def requires_plan(*allowed_plans):
                 return jsonify({'error': 'Payment service not available'}), 500
             
             # Get user
-            user = payment_svc.user_model.query.get(user_id)
+            user = _resolve_user(payment_svc.user_model, user_id)
             if not user:
                 return jsonify({'error': 'User not found'}), 404
             
@@ -97,7 +116,7 @@ def requires_active_subscription(fn):
             return jsonify({'error': 'Payment service not available'}), 500
         
         # Get user
-        user = payment_svc.user_model.query.get(user_id)
+        user = _resolve_user(payment_svc.user_model, user_id)
         if not user:
             return jsonify({'error': 'User not found'}), 404
         
@@ -144,7 +163,7 @@ def requires_feature(feature_name: str):
                 return jsonify({'error': 'Payment service not available'}), 500
             
             # Get user
-            user = payment_svc.user_model.query.get(user_id)
+            user = _resolve_user(payment_svc.user_model, user_id)
             if not user:
                 return jsonify({'error': 'User not found'}), 404
             

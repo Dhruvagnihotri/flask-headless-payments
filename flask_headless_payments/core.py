@@ -128,7 +128,16 @@ class PaymentSvc:
         
         # Register routes
         self._init_routes(app)
-        
+
+        # Register Stripe-aware error handlers (card declined -> 402,
+        # rate limit -> 429, auth/config error -> 500 critical-logged,
+        # etc.) — defined in errors.py but never wired in before this;
+        # any stripe.error escaping a route's own try/except fell through
+        # to Flask's default HTML error page instead of a clean JSON
+        # response. Confirmed no pre-existing app-wide error handlers to
+        # conflict with before enabling this.
+        self._init_error_handlers(app)
+
         # Store in app.extensions
         if not hasattr(app, 'extensions'):
             app.extensions = {}
@@ -383,6 +392,11 @@ class PaymentSvc:
         
         logger.info(f"Payment routes registered at {url_prefix} with blueprint '{self.blueprint_name}'")
     
+    def _init_error_handlers(self, app):
+        """Register Stripe-aware error handlers (see errors.py)."""
+        from flask_headless_payments.errors import register_error_handlers
+        register_error_handlers(app)
+
     def register_webhook_handler(self, event_type: str, handler):
         """
         Register a custom webhook handler.

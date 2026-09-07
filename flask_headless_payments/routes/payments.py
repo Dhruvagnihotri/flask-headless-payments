@@ -170,20 +170,50 @@ def create_payment_blueprint(
             # which is free — the user only ever lands on the URL the
             # frontend actually redirects them to. Customer dedupe (the
             # call above) is the load-bearing idempotency.
-            session = checkout_manager.create_checkout_session(
-                customer_id=customer_id,
-                price_id=price_id,
-                trial_days=trial_days,
-                metadata={'user_id': user.id, 'plan_name': plan_name},
-                success_url=success_url,
-                cancel_url=cancel_url,
-            )
-            
+            try:
+                session = checkout_manager.create_checkout_session(
+                    customer_id=customer_id,
+                    price_id=price_id,
+                    trial_days=trial_days,
+                    metadata={'user_id': user.id, 'plan_name': plan_name},
+                    success_url=success_url,
+                    cancel_url=cancel_url,
+                )
+            except stripe.error.InvalidRequestError as e:
+                # customer_id was on file but Stripe doesn't recognize it —
+                # happens when STRIPE_SECRET_KEY has switched to a
+                # different Stripe account than the one this customer_id
+                # was created under (confirmed in production 2026-09-06).
+                # Self-heal once: mint a fresh customer under the CURRENT
+                # account and retry, rather than hard-failing every
+                # checkout for anyone who touched an earlier account.
+                if getattr(e, 'code', None) == 'resource_missing' and getattr(e, 'param', None) == 'customer':
+                    logger.warning(
+                        f"Stale Stripe customer {customer_id} for user {user.id} "
+                        f"(not found on current account) — recreating"
+                    )
+                    customer_id = subscription_manager.recreate_stale_customer(
+                        user_id=user.id, email=user.email, name=getattr(user, 'first_name', None),
+                    )
+                    user.stripe_customer_id = customer_id
+                    from flask_headless_payments.extensions import get_db
+                    get_db().session.commit()
+                    session = checkout_manager.create_checkout_session(
+                        customer_id=customer_id,
+                        price_id=price_id,
+                        trial_days=trial_days,
+                        metadata={'user_id': user.id, 'plan_name': plan_name},
+                        success_url=success_url,
+                        cancel_url=cancel_url,
+                    )
+                else:
+                    raise
+
             return jsonify({
                 'session_id': session.id,
                 'url': session.url
             }), 200
-            
+
         except stripe.error.StripeError as e:
             logger.error(f"Stripe error: {e}")
             return jsonify({'error': str(e)}), 400
@@ -385,7 +415,11 @@ def create_payment_blueprint(
             
             return jsonify({
                 'message': 'Subscription canceled successfully',
-                'cancel_at_period_end': subscription.get('cancel_at_period_end')
+                # subscription is a raw StripeObject here (not run through
+                # update_user_subscription's internal dict conversion) —
+                # getattr works on StripeObject where .get() doesn't (see
+                # _as_plain_dict in subscription_manager.py for why).
+                'cancel_at_period_end': getattr(subscription, 'cancel_at_period_end', None)
             }), 200
             
         except stripe.error.StripeError as e:

@@ -1,10 +1,10 @@
 """
-flask_headless_payments.managers.subscription_manager_unified
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+flask_headless_payments.managers.subscription_manager
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-Unified production-grade subscription manager with full extensibility.
-
-This is THE subscription manager - production-ready with hooks and events.
+Production-grade subscription manager with full extensibility
+(hooks, events, retry/circuit-breaker, idempotency). The only
+subscription manager in the package — see managers/__init__.py.
 """
 
 import stripe
@@ -34,6 +34,40 @@ from flask_headless_payments.utils.monitoring import track_operation
 from flask_headless_payments.extensibility import get_hook_manager, get_event_manager
 
 logger = logging.getLogger(__name__)
+
+
+def _json_safe(obj):
+    """Recursively replace any Decimal in a (possibly nested) dict/list
+    with str — see webhook_manager._json_safe for the full "Object of
+    type Decimal is not JSON serializable" story (same stripe-python
+    version drift, confirmed in production 2026-09-06)."""
+    from decimal import Decimal
+    if isinstance(obj, Decimal):
+        return str(obj)
+    if isinstance(obj, dict):
+        return {k: _json_safe(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_json_safe(v) for v in obj]
+    return obj
+
+
+def _as_plain_dict(obj):
+    """Normalize a Stripe API object to a plain dict.
+
+    Callers pass either a raw StripeObject (e.g. straight from
+    stripe.Subscription.retrieve()/.modify()/.delete(), as
+    routes/payments.py and webhook_manager.py both do) or an
+    already-converted dict. Newer stripe-python releases dropped
+    StripeObject's dict-compatible `.get()` (confirmed in production
+    2026-09-06 — every subscription sync crashed with "'get' is a dict
+    method, but a Subscription is not a dict"), so this must run before
+    any `.get()` call below. `.to_dict()` recursively converts nested
+    StripeObjects/ListObjects too; _json_safe then handles the Decimal
+    fields `.to_dict()` leaves behind.
+    """
+    if hasattr(obj, 'to_dict'):
+        obj = obj.to_dict()
+    return _json_safe(obj)
 
 
 class SubscriptionManager:
@@ -214,7 +248,50 @@ class SubscriptionManager:
         except Exception as e:
             logger.error(f"Unexpected error creating customer: {e}")
             raise
-    
+
+    def recreate_stale_customer(self, user_id: int, email: str, name: Optional[str] = None) -> str:
+        """
+        Force-create a fresh Stripe customer and overwrite the stored
+        record, for when Stripe rejects a customer_id we have on file
+        with resource_missing ("No such customer").
+
+        This happens whenever STRIPE_SECRET_KEY switches to a different
+        Stripe account than the one a customer_id was originally created
+        under — get_or_create_customer's DB-first lookup (above) has no
+        way to know the stored id is now foreign to the active account
+        until Stripe rejects it downstream. Confirmed in production
+        2026-09-06: switching pdfcourt from a retired Stripe account to a
+        new one broke checkout for every user who'd ever started a
+        checkout under the old account, with a 400 "No such customer"
+        that looked like a real bug until traced to this cause.
+
+        Unlike get_or_create_customer, this always calls the Stripe API
+        (no idempotency_key dedup) — it should only run after Stripe
+        has already told us the existing id is invalid, so there's
+        nothing valid to replay.
+        """
+        stripe_customer = stripe.Customer.create(
+            email=email,
+            name=name,
+            metadata={'user_id': user_id},
+        )
+        customer = self.customer_model.query.filter_by(user_id=user_id).first()
+        if customer:
+            customer.stripe_customer_id = stripe_customer.id
+        else:
+            customer = self.customer_model(
+                stripe_customer_id=stripe_customer.id,
+                user_id=user_id,
+                email=email,
+                name=name,
+            )
+            self.db.session.add(customer)
+        self.db.session.commit()
+        logger.warning(
+            f"Recreated stale Stripe customer for user {user_id}: {stripe_customer.id}"
+        )
+        return stripe_customer.id
+
     @track_operation('create_subscription')
     @retry_with_backoff(max_retries=3)
     @with_circuit_breaker
@@ -325,6 +402,7 @@ class SubscriptionManager:
         Raises:
             SQLAlchemyError: If database operation fails
         """
+        subscription_data = _as_plain_dict(subscription_data)
         try:
             user = self.user_model.query.get(user_id)
             if not user:
