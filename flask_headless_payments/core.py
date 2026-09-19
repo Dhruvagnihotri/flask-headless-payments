@@ -181,10 +181,16 @@ class PaymentSvc:
             self.db = extensions.get_db()
             self.db.init_app(app)
         
-        # Create default models if custom ones not provided
+        # Create default models for any slot the caller hasn't already
+        # overridden (see create_default_models' own docstring — it skips
+        # defining a class for any table name already registered in
+        # db.metadata, exactly like flask-headless-auth's equivalent fix).
+        # Every app in this ecosystem overrides all four of these, which
+        # is exactly why this used to matter: db.create_all() created the
+        # full unused paymentsvc_* default set on every single start.
         from flask_headless_payments.models import create_default_models
-        (default_customer, default_payment, 
-         default_webhook_event, default_usage_record, default_idempotency_key) = create_default_models(self.db)
+        (default_customer, default_payment,
+         default_webhook_event, default_usage_record) = create_default_models(self.db)
         
         # Use custom models where provided, defaults otherwise
         self.customer_model = self.customer_model or default_customer
