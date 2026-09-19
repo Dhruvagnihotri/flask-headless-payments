@@ -393,9 +393,14 @@ class PaymentSvc:
         logger.info(f"Payment routes registered at {url_prefix} with blueprint '{self.blueprint_name}'")
     
     def _init_error_handlers(self, app):
-        """Register Stripe-aware error handlers (see errors.py)."""
+        """Register Stripe-aware error handlers (see errors.py).
+
+        Passes user_model so the handlers can roll back the session on a
+        DB exception — without it, a dropped connection reaching one of
+        these handlers poisons the session for every subsequent request
+        until the process restarts (confirmed live, 2026-09-17)."""
         from flask_headless_payments.errors import register_error_handlers
-        register_error_handlers(app)
+        register_error_handlers(app, db_model=self.user_model)
 
     def register_webhook_handler(self, event_type: str, handler):
         """
