@@ -349,7 +349,8 @@ class PaymentSvc:
             db=self.db,
             user_model=self.user_model,
             webhook_event_model=self.webhook_event_model,
-            subscription_manager=self.subscription_manager
+            subscription_manager=self.subscription_manager,
+            payment_model=self.payment_model
         )
         
         logger.info("Payment managers initialized")

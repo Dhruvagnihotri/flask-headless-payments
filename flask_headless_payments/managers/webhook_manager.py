@@ -58,20 +58,24 @@ def _as_plain_dict(obj):
 class WebhookManager:
     """Manages Stripe webhook events with proper transaction handling."""
     
-    def __init__(self, db, user_model, webhook_event_model, subscription_manager):
+    def __init__(self, db, user_model, webhook_event_model, subscription_manager, payment_model=None):
         """
         Initialize webhook manager.
-        
+
         Args:
             db: SQLAlchemy database instance
             user_model: User model class
             webhook_event_model: WebhookEvent model class
             subscription_manager: SubscriptionManager instance
+            payment_model: Payment model class (optional — without it,
+                _handle_invoice_paid/_handle_payment_intent_succeeded log
+                and skip instead of recording a Payment row)
         """
         self.db = db
         self.user_model = user_model
         self.webhook_event_model = webhook_event_model
         self.subscription_manager = subscription_manager
+        self.payment_model = payment_model
         self.event_handlers = {}
         self.post_commit_callbacks = {}  # For business logic after successful commit
     
@@ -392,10 +396,13 @@ class WebhookManager:
         
         elif event_type == 'invoice.payment_succeeded':
             user = self._handle_invoice_paid(event_data, commit=commit)
-        
+
+        elif event_type == 'payment_intent.succeeded':
+            user = self._handle_payment_intent_succeeded(event_data, commit=commit)
+
         elif event_type == 'invoice.payment_failed':
             user = self._handle_invoice_failed(event_data, commit=commit)
-        
+
         else:
             logger.info(f"No default handler for event type: {event_type}")
         
@@ -494,21 +501,138 @@ class WebhookManager:
 
         return user
     
+    def _upsert_payment_record(self, *, user, payment_intent_id, invoice_id, amount, currency,
+                                status, payment_method=None, receipt_url=None, description=None,
+                                commit=False):
+        """
+        Get-or-create a Payment row, keyed by stripe_payment_intent_id.
+
+        Confirmed in production (2026-09-19): invoice.payment_succeeded,
+        payment_intent.succeeded, and charge.succeeded were ALL received
+        and marked processed=True for real completed subscription
+        payments — 1121 webhook events, 47 successful invoice payments —
+        yet self.payment_model (paymentsvc_payments / the app's own
+        override) had never once received a row. No default handler ever
+        created one; every handler above only updates the User's
+        subscription state. This is the fix.
+
+        Keyed by payment_intent_id, not invoice_id, because a single
+        subscription payment fires BOTH invoice.payment_succeeded and
+        payment_intent.succeeded for the same underlying transaction —
+        without a shared idempotent key, hooking both (needed to also
+        cover one-time, non-invoice payments) would double-record every
+        subscription payment. Whichever event arrives first creates the
+        row; the second finds it via get_or_create and no-ops, in either
+        delivery order.
+        """
+        if not self.payment_model:
+            logger.info(
+                f"No payment_model configured — skipping Payment record for "
+                f"payment_intent={payment_intent_id!r} invoice={invoice_id!r}"
+            )
+            return
+
+        query = self.payment_model.query
+        existing = None
+        if payment_intent_id:
+            existing = query.filter_by(stripe_payment_intent_id=payment_intent_id).first()
+        if existing is None and not payment_intent_id and invoice_id:
+            # No payment_intent on this invoice (e.g. $0 invoice, or a
+            # non-card payment method Stripe doesn't attach a PI to) —
+            # fall back to invoice_id as the dedup key so it isn't silently
+            # dropped, and so a retry of the same invoice doesn't duplicate.
+            existing = query.filter_by(stripe_invoice_id=invoice_id).first()
+
+        if existing:
+            # Already recorded (e.g. the other event of the pair already
+            # created it, or this is a Stripe redelivery). Keep it current
+            # rather than silently ignoring a status change.
+            existing.status = status
+            if receipt_url:
+                existing.receipt_url = receipt_url
+            return existing
+
+        payment = self.payment_model(
+            stripe_payment_intent_id=payment_intent_id,
+            stripe_invoice_id=invoice_id,
+            user_id=user.id if user else None,
+            amount=amount or 0,
+            currency=currency or 'usd',
+            status=status,
+            payment_method=payment_method,
+            receipt_url=receipt_url,
+            description=description,
+        )
+        self.db.session.add(payment)
+        if commit:
+            self.db.session.commit()
+        logger.info(
+            f"Recorded payment: payment_intent={payment_intent_id!r} "
+            f"invoice={invoice_id!r} amount={amount} {currency} status={status}"
+        )
+        return payment
+
     def _handle_invoice_paid(self, invoice: Dict[str, Any], commit: bool = False) -> Optional[Any]:
         """
-        Handle invoice.payment_succeeded event.
-        
+        Handle invoice.payment_succeeded event — the canonical event for a
+        completed subscription billing cycle (including the first invoice
+        at subscription creation).
+
         Args:
             commit: Whether to commit (False when part of larger transaction)
-            
+
         Returns:
             User object if found
         """
         customer_id = invoice.get('customer')
         user = self.user_model.query.filter_by(stripe_customer_id=customer_id).first() if customer_id else None
+
+        self._upsert_payment_record(
+            user=user,
+            payment_intent_id=invoice.get('payment_intent'),
+            invoice_id=invoice.get('id'),
+            amount=invoice.get('amount_paid'),
+            currency=invoice.get('currency'),
+            status='succeeded',
+            receipt_url=invoice.get('hosted_invoice_url'),
+            description=invoice.get('description') or 'Subscription invoice payment',
+            commit=commit,
+        )
+
         logger.info(f"Invoice {invoice['id']} paid successfully")
         return user
-    
+
+    def _handle_payment_intent_succeeded(self, payment_intent: Dict[str, Any], commit: bool = False) -> Optional[Any]:
+        """
+        Handle payment_intent.succeeded event — the canonical event for a
+        completed one-time ("payment" mode Checkout) payment that has no
+        associated invoice. Also fires for subscription payments (which
+        already have an invoice-keyed row from _handle_invoice_paid) —
+        see _upsert_payment_record's docstring for how that's deduplicated.
+
+        Args:
+            commit: Whether to commit (False when part of larger transaction)
+
+        Returns:
+            User object if found
+        """
+        customer_id = payment_intent.get('customer')
+        user = self.user_model.query.filter_by(stripe_customer_id=customer_id).first() if customer_id else None
+
+        self._upsert_payment_record(
+            user=user,
+            payment_intent_id=payment_intent.get('id'),
+            invoice_id=payment_intent.get('invoice'),
+            amount=payment_intent.get('amount_received') or payment_intent.get('amount'),
+            currency=payment_intent.get('currency'),
+            status='succeeded',
+            description=payment_intent.get('description'),
+            commit=commit,
+        )
+
+        logger.info(f"PaymentIntent {payment_intent['id']} succeeded")
+        return user
+
     def _handle_invoice_failed(self, invoice: Dict[str, Any], commit: bool = False) -> Optional[Any]:
         """
         Handle invoice.payment_failed event.
@@ -521,6 +645,18 @@ class WebhookManager:
         """
         customer_id = invoice.get('customer')
         user = self.user_model.query.filter_by(stripe_customer_id=customer_id).first() if customer_id else None
+
+        self._upsert_payment_record(
+            user=user,
+            payment_intent_id=invoice.get('payment_intent'),
+            invoice_id=invoice.get('id'),
+            amount=invoice.get('amount_due'),
+            currency=invoice.get('currency'),
+            status='failed',
+            description=invoice.get('description') or 'Subscription invoice payment failed',
+            commit=commit,
+        )
+
         logger.warning(f"Invoice {invoice['id']} payment failed")
         return user
 
