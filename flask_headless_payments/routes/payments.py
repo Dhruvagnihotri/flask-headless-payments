@@ -215,12 +215,25 @@ def create_payment_blueprint(
             }), 200
 
         except stripe.error.StripeError as e:
+            # This route commits directly (lines above, updating
+            # stripe_customer_id) instead of going through a manager method —
+            # every manager method in this package rolls back on its own
+            # failure path, but a raw commit() here has no such protection.
+            # If either commit throws, the exception lands in one of these
+            # two blocks; without a rollback the session stays poisoned for
+            # every subsequent request on this worker (the exact bug fixed
+            # in errors.py's global handlers — this route's own local except
+            # blocks catch the exception before it ever reaches those).
+            from flask_headless_payments.extensions import get_db
+            get_db().session.rollback()
             logger.error(f"Stripe error: {e}")
             return jsonify({'error': str(e)}), 400
         except Exception as e:
+            from flask_headless_payments.extensions import get_db
+            get_db().session.rollback()
             logger.error(f"Error creating checkout: {e}")
             return jsonify({'error': 'Failed to create checkout session'}), 500
-    
+
     @bp.route('/checkout/status', methods=['GET'])
     @jwt_required()
     def checkout_status():

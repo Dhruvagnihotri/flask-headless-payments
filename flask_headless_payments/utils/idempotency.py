@@ -115,6 +115,7 @@ class IdempotencyManager:
             return False, None
             
         except Exception as e:
+            self.db.session.rollback()
             logger.error(f"Error checking idempotency: {e}")
             return False, None
     
