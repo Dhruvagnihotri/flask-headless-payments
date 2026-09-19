@@ -182,15 +182,23 @@ class PaymentSvc:
             self.db.init_app(app)
         
         # Create default models for any slot the caller hasn't already
-        # overridden (see create_default_models' own docstring — it skips
-        # defining a class for any table name already registered in
-        # db.metadata, exactly like flask-headless-auth's equivalent fix).
-        # Every app in this ecosystem overrides all four of these, which
-        # is exactly why this used to matter: db.create_all() created the
-        # full unused paymentsvc_* default set on every single start.
+        # overridden. Must be skip_X=True keyed off whether X_model was
+        # actually passed in — NOT a "does a table named paymentsvc_X
+        # already exist" guess (see create_default_models' own docstring):
+        # every real app's custom models use their own table names
+        # (pdfcourt's are bare 'customers', 'payments', ...), never
+        # 'paymentsvc_*', so a name-collision check never fires and the
+        # full unused default set kept getting created via db.create_all()
+        # on every single start regardless.
         from flask_headless_payments.models import create_default_models
         (default_customer, default_payment,
-         default_webhook_event, default_usage_record) = create_default_models(self.db)
+         default_webhook_event, default_usage_record) = create_default_models(
+            self.db,
+            skip_customer=self.customer_model is not None,
+            skip_payment=self.payment_model is not None,
+            skip_webhook_event=self.webhook_event_model is not None,
+            skip_usage_record=self.usage_record_model is not None,
+        )
         
         # Use custom models where provided, defaults otherwise
         self.customer_model = self.customer_model or default_customer

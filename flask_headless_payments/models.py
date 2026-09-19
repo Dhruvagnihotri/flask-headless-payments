@@ -15,40 +15,47 @@ from flask_headless_payments.mixins import (
 _default_models_cache = {}
 
 
-def create_default_models(db):
+def create_default_models(db, skip_customer=False, skip_payment=False,
+                           skip_webhook_event=False, skip_usage_record=False):
     """
     Create default model classes using the provided db instance.
 
-    Each of Customer/Payment/WebhookEvent/UsageRecord is skipped (returned
-    as None, no table ever created) if a table by that exact name is
-    already registered in db.metadata — i.e. the caller already defined
-    its own custom model under that name. Previously these were always
-    defined regardless of overrides: an app providing all four custom
-    models (the common case — every real app in this ecosystem does)
-    still got the full paymentsvc_* default set created via db.create_all()
-    on every start, forever. Mirrors the same fix already applied to
-    flask-headless-auth's create_default_models(), and the same
-    already-established pattern this file's own IdempotencyKey removal
-    (see below) responds to: don't ship dead tables by default.
+    Each of Customer/Payment/WebhookEvent/UsageRecord is skipped entirely
+    (returned as None, no table ever created) when its skip_* flag is
+    True — pass skip_X=True when the caller already provided its own
+    X_model. This has to be an explicit flag, not a "does a table by this
+    name already exist" guess: the defaults are hardcoded to
+    paymentsvc_customers/paymentsvc_payments/etc, but real apps' custom
+    models use their own names (pdfcourt's are bare 'customers',
+    'payments', ...) — a name-based check would never match and the
+    unused paymentsvc_* defaults would keep getting created regardless,
+    which is exactly what was still happening after an earlier pass at
+    this fix that only checked db.metadata.tables. The metadata check is
+    kept too, as a second guard for the case where a custom model
+    happens to reuse one of these exact table names.
 
     Args:
         db: SQLAlchemy database instance
+        skip_customer: True if the caller provided its own customer_model
+        skip_payment: True if the caller provided its own payment_model
+        skip_webhook_event: True if the caller provided its own webhook_event_model
+        skip_usage_record: True if the caller provided its own usage_record_model
 
     Returns:
         tuple: (Customer, Payment, WebhookEvent, UsageRecord)
-        Any entry may be None if a same-named table already exists.
+        Any entry may be None if skipped or a same-named table already exists.
     """
 
-    # Return cached models if already created for this db instance
-    db_id = id(db)
-    if db_id in _default_models_cache:
-        return _default_models_cache[db_id]
+    # Return cached models if already created for this exact combination
+    cache_key = (id(db), skip_customer, skip_payment, skip_webhook_event, skip_usage_record)
+    if cache_key in _default_models_cache:
+        return _default_models_cache[cache_key]
 
     def _already_mapped(tablename):
         return tablename in db.metadata.tables
 
     Customer = None
-    if not _already_mapped('paymentsvc_customers'):
+    if not skip_customer and not _already_mapped('paymentsvc_customers'):
         class Customer(db.Model, CustomerMixin):
             """Default Customer model for Stripe customers."""
             __tablename__ = 'paymentsvc_customers'
@@ -81,7 +88,7 @@ def create_default_models(db):
             updated_at = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
 
     Payment = None
-    if not _already_mapped('paymentsvc_payments'):
+    if not skip_payment and not _already_mapped('paymentsvc_payments'):
         class Payment(db.Model, PaymentMixin):
             """Default Payment model for tracking payments."""
             __tablename__ = 'paymentsvc_payments'
@@ -109,7 +116,7 @@ def create_default_models(db):
             updated_at = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
 
     WebhookEvent = None
-    if not _already_mapped('paymentsvc_webhook_events'):
+    if not skip_webhook_event and not _already_mapped('paymentsvc_webhook_events'):
         class WebhookEvent(db.Model, WebhookEventMixin):
             """Default WebhookEvent model for tracking Stripe webhooks."""
             __tablename__ = 'paymentsvc_webhook_events'
@@ -131,7 +138,7 @@ def create_default_models(db):
             created_at = db.Column(db.DateTime, default=datetime.utcnow, nullable=False)
 
     UsageRecord = None
-    if not _already_mapped('paymentsvc_usage_records'):
+    if not skip_usage_record and not _already_mapped('paymentsvc_usage_records'):
         class UsageRecord(db.Model):
             """Default UsageRecord model for metered billing."""
             __tablename__ = 'paymentsvc_usage_records'
@@ -153,6 +160,6 @@ def create_default_models(db):
 
     # Cache and return
     result = (Customer, Payment, WebhookEvent, UsageRecord)
-    _default_models_cache[db_id] = result
+    _default_models_cache[cache_key] = result
 
     return result
