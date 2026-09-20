@@ -149,14 +149,27 @@ class SubscriptionManager:
                 if is_duplicate and cached_result:
                     logger.info(f"Returning cached customer for user {user_id}")
                     return cached_result.get('customer_id')
-            
-            # Check if customer exists in database
-            customer = self.customer_model.query.filter_by(user_id=user_id).first()
-            
-            if customer:
-                logger.info(f"Found existing customer {customer.stripe_customer_id} for user {user_id}")
-                return customer.stripe_customer_id
-            
+
+            # Prefer user_model.stripe_customer_id (SubscriptionMixin) over
+            # a separate Customer row when the field is present — see
+            # core.py's skip_customer logic for why. `user` gets reused
+            # below when creating a new customer, so this isn't wasted
+            # even on the cold path.
+            user = self.user_model.query.get(user_id)
+            uses_user_field = user is not None and hasattr(user, 'stripe_customer_id')
+
+            if uses_user_field:
+                if user.stripe_customer_id:
+                    logger.info(f"Found existing customer {user.stripe_customer_id} for user {user_id} (via user_model)")
+                    return user.stripe_customer_id
+            else:
+                # Fallback: no stripe_customer_id on user_model, use the
+                # separate Customer table as before.
+                customer = self.customer_model.query.filter_by(user_id=user_id).first()
+                if customer:
+                    logger.info(f"Found existing customer {customer.stripe_customer_id} for user {user_id}")
+                    return customer.stripe_customer_id
+
             # HOOK: before_customer_create
             self.hook_manager.trigger(
                 'before_customer_create',
@@ -175,13 +188,16 @@ class SubscriptionManager:
             
             # Save to database with transaction
             try:
-                customer = self.customer_model(
-                    stripe_customer_id=stripe_customer.id,
-                    user_id=user_id,
-                    email=email,
-                    name=name
-                )
-                self.db.session.add(customer)
+                if uses_user_field:
+                    user.stripe_customer_id = stripe_customer.id
+                else:
+                    customer = self.customer_model(
+                        stripe_customer_id=stripe_customer.id,
+                        user_id=user_id,
+                        email=email,
+                        name=name
+                    )
+                    self.db.session.add(customer)
                 self.db.session.commit()  # Customer creation needs immediate commit for Stripe consistency
                 
                 # Save idempotency result
@@ -275,17 +291,22 @@ class SubscriptionManager:
             name=name,
             metadata={'user_id': user_id},
         )
-        customer = self.customer_model.query.filter_by(user_id=user_id).first()
-        if customer:
-            customer.stripe_customer_id = stripe_customer.id
+
+        user = self.user_model.query.get(user_id)
+        if user is not None and hasattr(user, 'stripe_customer_id'):
+            user.stripe_customer_id = stripe_customer.id
         else:
-            customer = self.customer_model(
-                stripe_customer_id=stripe_customer.id,
-                user_id=user_id,
-                email=email,
-                name=name,
-            )
-            self.db.session.add(customer)
+            customer = self.customer_model.query.filter_by(user_id=user_id).first()
+            if customer:
+                customer.stripe_customer_id = stripe_customer.id
+            else:
+                customer = self.customer_model(
+                    stripe_customer_id=stripe_customer.id,
+                    user_id=user_id,
+                    email=email,
+                    name=name,
+                )
+                self.db.session.add(customer)
         self.db.session.commit()
         logger.warning(
             f"Recreated stale Stripe customer for user {user_id}: {stripe_customer.id}"

@@ -190,11 +190,31 @@ class PaymentSvc:
         # 'paymentsvc_*', so a name-collision check never fires and the
         # full unused default set kept getting created via db.create_all()
         # on every single start regardless.
+        # Customer is additionally skipped whenever user_model already
+        # carries its own stripe_customer_id (SubscriptionMixin puts one
+        # there) — every real consumer of this package uses that mixin,
+        # and subscription_manager.py's get_or_create_customer/
+        # recreate_stale_customer now read and write that field directly
+        # in preference to a separate Customer row when it's present. A
+        # dedicated Customer table only earns its keep for apps whose
+        # user model does NOT carry stripe_customer_id itself (e.g. a
+        # billing model where one Stripe customer maps to multiple
+        # internal users) — confirmed via a real audit that pdfcourt's
+        # own Customer usage was otherwise 100% redundant with the field
+        # already on its User model: every webhook handler resolves the
+        # customer_id -> user mapping via user_model.query.filter_by(
+        # stripe_customer_id=...), never via Customer at all, and 8 of
+        # Customer's 12 columns (payment method, address, tax) were never
+        # read or written anywhere — Stripe's own hosted Customer Portal
+        # is what actually manages that data.
         from flask_headless_payments.models import create_default_models
         (default_customer, default_payment,
          default_webhook_event, default_usage_record) = create_default_models(
             self.db,
-            skip_customer=self.customer_model is not None,
+            skip_customer=(
+                self.customer_model is not None
+                or (self.user_model is not None and hasattr(self.user_model, 'stripe_customer_id'))
+            ),
             skip_payment=self.payment_model is not None,
             skip_webhook_event=self.webhook_event_model is not None,
             skip_usage_record=self.usage_record_model is not None,
