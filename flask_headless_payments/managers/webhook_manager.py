@@ -58,7 +58,8 @@ def _as_plain_dict(obj):
 class WebhookManager:
     """Manages Stripe webhook events with proper transaction handling."""
     
-    def __init__(self, db, user_model, webhook_event_model, subscription_manager, payment_model=None):
+    def __init__(self, db, user_model, webhook_event_model, subscription_manager,
+                 payment_model=None, subscription_event_model=None):
         """
         Initialize webhook manager.
 
@@ -70,12 +71,17 @@ class WebhookManager:
             payment_model: Payment model class (optional — without it,
                 _handle_invoice_paid/_handle_payment_intent_succeeded log
                 and skip instead of recording a Payment row)
+            subscription_event_model: SubscriptionEvent model class (optional
+                — without it, subscription created/updated/deleted handlers
+                still update user_model's current-state fields exactly as
+                before, they just skip appending a history row)
         """
         self.db = db
         self.user_model = user_model
         self.webhook_event_model = webhook_event_model
         self.subscription_manager = subscription_manager
         self.payment_model = payment_model
+        self.subscription_event_model = subscription_event_model
         self.event_handlers = {}
         self.post_commit_callbacks = {}  # For business logic after successful commit
     
@@ -444,31 +450,53 @@ class WebhookManager:
             User object if found
         """
         customer_id = subscription.get('customer')
-        
+
         # Find user by customer ID
         user = self.user_model.query.filter_by(stripe_customer_id=customer_id).first()
         if user:
-            self.subscription_manager.update_user_subscription(user.id, subscription, commit=commit)
-        
+            self.subscription_manager.update_user_subscription(user.id, subscription, commit=False)
+            self._record_subscription_event(
+                user=user,
+                event_type='created',
+                stripe_subscription_id=subscription.get('id'),
+                plan_name=user.plan_name,
+                plan_status=user.plan_status,
+                current_period_start=user.current_period_start,
+                current_period_end=user.current_period_end,
+                cancel_at_period_end=user.cancel_at_period_end,
+                commit=commit,
+            )
+
         return user
-    
+
     def _handle_subscription_updated(self, subscription: Dict[str, Any], commit: bool = False) -> Optional[Any]:
         """
         Handle customer.subscription.updated event.
-        
+
         Args:
             commit: Whether to commit (False when part of larger transaction)
-            
+
         Returns:
             User object if found
         """
         customer_id = subscription.get('customer')
-        
+
         # Find user by customer ID
         user = self.user_model.query.filter_by(stripe_customer_id=customer_id).first()
         if user:
-            self.subscription_manager.update_user_subscription(user.id, subscription, commit=commit)
-        
+            self.subscription_manager.update_user_subscription(user.id, subscription, commit=False)
+            self._record_subscription_event(
+                user=user,
+                event_type='updated',
+                stripe_subscription_id=subscription.get('id'),
+                plan_name=user.plan_name,
+                plan_status=user.plan_status,
+                current_period_start=user.current_period_start,
+                current_period_end=user.current_period_end,
+                cancel_at_period_end=user.cancel_at_period_end,
+                commit=commit,
+            )
+
         return user
     
     def _handle_subscription_deleted(self, subscription: Dict[str, Any], commit: bool = False) -> Optional[Any]:
@@ -494,13 +522,64 @@ class WebhookManager:
             # underscore-prefixed attributes for ORM persistence so this
             # rides along on the in-memory object only.
             user._prev_plan_status = user.plan_status
+            self._record_subscription_event(
+                user=user,
+                event_type='canceled',
+                stripe_subscription_id=subscription.get('id') or user.stripe_subscription_id,
+                plan_name=user.plan_name,
+                plan_status='canceled',
+                current_period_start=user.current_period_start,
+                current_period_end=user.current_period_end,
+                cancel_at_period_end=True,
+                commit=False,
+            )
             user.plan_status = 'canceled'
             user.stripe_subscription_id = None
             if commit:
                 self.db.session.commit()
 
         return user
-    
+
+    def _record_subscription_event(self, *, user, event_type, stripe_subscription_id,
+                                     plan_name=None, plan_status=None,
+                                     current_period_start=None, current_period_end=None,
+                                     cancel_at_period_end=None, commit=False):
+        """
+        Append a row to the subscription history ledger, if configured.
+
+        Reads the just-applied current-state fields off `user` rather than
+        re-parsing the raw Stripe payload — update_user_subscription()
+        already did that extraction (UTC timestamp conversion, the
+        price-metadata plan_name lookup), so this stays a pure snapshot of
+        what was actually saved instead of a second, possibly-drifting
+        interpretation of the same webhook.
+
+        No-ops if the caller never configured a subscription_event_model
+        (default is skipped entirely, matching payment_model's pattern in
+        _upsert_payment_record).
+        """
+        if not self.subscription_event_model:
+            return
+
+        event = self.subscription_event_model(
+            user_id=user.id,
+            stripe_subscription_id=stripe_subscription_id,
+            event_type=event_type,
+            plan_name=plan_name,
+            plan_status=plan_status,
+            current_period_start=current_period_start,
+            current_period_end=current_period_end,
+            cancel_at_period_end=cancel_at_period_end,
+        )
+        self.db.session.add(event)
+        if commit:
+            self.db.session.commit()
+        logger.info(
+            f"Recorded subscription event: user={user.id} type={event_type} "
+            f"subscription={stripe_subscription_id!r} plan={plan_name!r} status={plan_status!r}"
+        )
+        return event
+
     def _upsert_payment_record(self, *, user, payment_intent_id, invoice_id, amount, currency,
                                 status, payment_method=None, receipt_url=None, description=None,
                                 commit=False):

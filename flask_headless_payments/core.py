@@ -34,6 +34,7 @@ class PaymentSvc:
         payment_model=None,
         webhook_event_model=None,
         usage_record_model=None,
+        subscription_event_model=None,
         plans: Optional[Dict[str, Dict[str, Any]]] = None,
         blueprint_name: str = 'paymentsvc',
         url_prefix: Optional[str] = None,
@@ -50,6 +51,9 @@ class PaymentSvc:
             payment_model: Custom Payment model (optional)
             webhook_event_model: Custom WebhookEvent model (optional)
             usage_record_model: Custom UsageRecord model (optional)
+            subscription_event_model: Custom SubscriptionEvent model (optional) —
+                append-only subscription history ledger, populated automatically
+                from customer.subscription.created/updated/deleted webhooks
             plans: Plan configuration dictionary
             blueprint_name: Unique name for the blueprint (default: 'paymentsvc')
             url_prefix: URL prefix for routes (default: from config or '/api/payments')
@@ -65,6 +69,7 @@ class PaymentSvc:
         self.payment_model = payment_model
         self.webhook_event_model = webhook_event_model
         self.usage_record_model = usage_record_model
+        self.subscription_event_model = subscription_event_model
         
         # Store plan configuration
         self.plans = plans or {}
@@ -208,8 +213,8 @@ class PaymentSvc:
         # read or written anywhere — Stripe's own hosted Customer Portal
         # is what actually manages that data.
         from flask_headless_payments.models import create_default_models
-        (default_customer, default_payment,
-         default_webhook_event, default_usage_record) = create_default_models(
+        (default_customer, default_payment, default_webhook_event,
+         default_usage_record, default_subscription_event) = create_default_models(
             self.db,
             skip_customer=(
                 self.customer_model is not None
@@ -218,10 +223,12 @@ class PaymentSvc:
             skip_payment=self.payment_model is not None,
             skip_webhook_event=self.webhook_event_model is not None,
             skip_usage_record=self.usage_record_model is not None,
+            skip_subscription_event=self.subscription_event_model is not None,
         )
-        
+
         # Use custom models where provided, defaults otherwise
         self.customer_model = self.customer_model or default_customer
+        self.subscription_event_model = self.subscription_event_model or default_subscription_event
         self.payment_model = self.payment_model or default_payment
         self.webhook_event_model = self.webhook_event_model or default_webhook_event
         self.usage_record_model = self.usage_record_model or default_usage_record
@@ -378,7 +385,8 @@ class PaymentSvc:
             user_model=self.user_model,
             webhook_event_model=self.webhook_event_model,
             subscription_manager=self.subscription_manager,
-            payment_model=self.payment_model
+            payment_model=self.payment_model,
+            subscription_event_model=self.subscription_event_model
         )
         
         logger.info("Payment managers initialized")

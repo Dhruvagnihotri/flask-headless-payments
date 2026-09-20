@@ -16,7 +16,8 @@ _default_models_cache = {}
 
 
 def create_default_models(db, skip_customer=False, skip_payment=False,
-                           skip_webhook_event=False, skip_usage_record=False):
+                           skip_webhook_event=False, skip_usage_record=False,
+                           skip_subscription_event=False):
     """
     Create default model classes using the provided db instance.
 
@@ -34,20 +35,28 @@ def create_default_models(db, skip_customer=False, skip_payment=False,
     kept too, as a second guard for the case where a custom model
     happens to reuse one of these exact table names.
 
+    SubscriptionEvent is different from the other four: it's an
+    append-only history ledger, not a current-state mirror, so there's
+    no equivalent "the app already tracks this elsewhere" reason to skip
+    it by default the way Customer often is. It only gets skipped when a
+    custom subscription_event_model is explicitly provided.
+
     Args:
         db: SQLAlchemy database instance
         skip_customer: True if the caller provided its own customer_model
         skip_payment: True if the caller provided its own payment_model
         skip_webhook_event: True if the caller provided its own webhook_event_model
         skip_usage_record: True if the caller provided its own usage_record_model
+        skip_subscription_event: True if the caller provided its own subscription_event_model
 
     Returns:
-        tuple: (Customer, Payment, WebhookEvent, UsageRecord)
+        tuple: (Customer, Payment, WebhookEvent, UsageRecord, SubscriptionEvent)
         Any entry may be None if skipped or a same-named table already exists.
     """
 
     # Return cached models if already created for this exact combination
-    cache_key = (id(db), skip_customer, skip_payment, skip_webhook_event, skip_usage_record)
+    cache_key = (id(db), skip_customer, skip_payment, skip_webhook_event,
+                 skip_usage_record, skip_subscription_event)
     if cache_key in _default_models_cache:
         return _default_models_cache[cache_key]
 
@@ -158,8 +167,61 @@ def create_default_models(db, skip_customer=False, skip_payment=False,
             timestamp = db.Column(db.DateTime, default=datetime.utcnow, nullable=False, index=True)
             usage_metadata = db.Column(db.JSON)  # Renamed from 'metadata' to 'usage_metadata'
 
+    SubscriptionEvent = None
+    if not skip_subscription_event and not _already_mapped('paymentsvc_subscription_events'):
+        class SubscriptionEvent(db.Model):
+            """
+            Append-only subscription history ledger — one row per
+            customer.subscription.created/updated/deleted event, snapshotting
+            the plan/status/period fields at that moment.
+
+            Not a replacement for the current-state fields SubscriptionMixin
+            puts on user_model (those stay the fast, zero-join, hot-path
+            read — checked on every authenticated request in real apps, e.g.
+            trial-expiry enforcement). This is the thing that's genuinely
+            missing without a separate table: plan changes and renewal
+            cycles get silently overwritten with no history, unlike trials
+            (which the mixin/app pattern already tracks historically
+            elsewhere) — "what plan was this user on in March" or "how many
+            times has this subscription been modified" can't be answered
+            from current-state columns alone. Mirrors the same
+            get-or-create/webhook-driven population pattern as Payment.
+            """
+            __tablename__ = 'paymentsvc_subscription_events'
+
+            id = db.Column(db.Integer, primary_key=True)
+            user_id = db.Column(db.Integer, nullable=False, index=True)
+            stripe_subscription_id = db.Column(db.String(255), index=True)
+
+            # 'created' | 'updated' | 'canceled' — semantic, not the raw
+            # Stripe event type (WebhookEvent already stores that verbatim;
+            # duplicating it here would add nothing).
+            event_type = db.Column(db.String(20), nullable=False, index=True)
+
+            plan_name = db.Column(db.String(100))
+            plan_status = db.Column(db.String(50))
+            current_period_start = db.Column(db.DateTime)
+            current_period_end = db.Column(db.DateTime)
+            cancel_at_period_end = db.Column(db.Boolean)
+
+            occurred_at = db.Column(db.DateTime, default=datetime.utcnow, nullable=False, index=True)
+
+            def to_dict(self):
+                return {
+                    'id': self.id,
+                    'user_id': self.user_id,
+                    'stripe_subscription_id': self.stripe_subscription_id,
+                    'event_type': self.event_type,
+                    'plan_name': self.plan_name,
+                    'plan_status': self.plan_status,
+                    'current_period_start': self.current_period_start.isoformat() if self.current_period_start else None,
+                    'current_period_end': self.current_period_end.isoformat() if self.current_period_end else None,
+                    'cancel_at_period_end': self.cancel_at_period_end,
+                    'occurred_at': self.occurred_at.isoformat() if self.occurred_at else None,
+                }
+
     # Cache and return
-    result = (Customer, Payment, WebhookEvent, UsageRecord)
+    result = (Customer, Payment, WebhookEvent, UsageRecord, SubscriptionEvent)
     _default_models_cache[cache_key] = result
 
     return result
