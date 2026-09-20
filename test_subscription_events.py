@@ -130,8 +130,15 @@ def test_default_creation_and_created_updated_canceled_flow():
         assert user.plan_name == 'enterprise'
         assert user.plan_status == 'active'
 
-        # customer.subscription.deleted (cancellation)
-        deleted_payload = _subscription_payload('sub_1', 'cus_alice', 'canceled', t1, t2, plan_name='enterprise')
+        # customer.subscription.deleted (cancellation) — deliberately uses a
+        # DIFFERENT current_period_end (t3) and cancel_at_period_end=False
+        # (an immediate, not at-period-end, cancellation) than the prior
+        # updated event, to catch the regression where the ledger snapshot
+        # was written from stale user fields instead of this payload.
+        t3 = int(datetime(2026, 3, 5, tzinfo=timezone.utc).timestamp())
+        deleted_payload = _subscription_payload(
+            'sub_1', 'cus_alice', 'canceled', t2, t3, cancel_at_period_end=False, plan_name='enterprise'
+        )
         payments.webhook_manager._handle_subscription_deleted(deleted_payload, commit=True)
 
         events = payments.subscription_event_model.query.filter_by(user_id=user.id).order_by(
@@ -142,7 +149,12 @@ def test_default_creation_and_created_updated_canceled_flow():
         assert events[2].plan_status == 'canceled'
         assert events[2].stripe_subscription_id == 'sub_1', \
             "canceled event must still record which subscription was canceled"
-        assert events[2].cancel_at_period_end is True
+        assert events[2].current_period_end is not None
+        assert events[2].current_period_end.year == 2026 and events[2].current_period_end.month == 3 \
+            and events[2].current_period_end.day == 5, \
+            "canceled event must snapshot the DELETED payload's period end, not a stale value from the prior updated event"
+        assert events[2].cancel_at_period_end is False, \
+            "canceled event must reflect the payload's actual cancel_at_period_end, not a hardcoded True"
 
         # Post-cancellation current-state: subscription_id cleared, status canceled —
         # unchanged behavior from before this fix.

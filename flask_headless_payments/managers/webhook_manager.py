@@ -514,26 +514,33 @@ class WebhookManager:
         # Find user by customer ID
         user = self.user_model.query.filter_by(stripe_customer_id=customer_id).first()
         if user:
-            # Stash the pre-cancel plan_status as a transient attribute so
-            # post-commit callbacks can classify churn (trial vs paid)
-            # accurately. We mutate user.plan_status to 'canceled' below;
-            # by the time the callback runs, that mutation is committed
-            # and the original signal is gone. SQLAlchemy ignores
+            # Stash the pre-cancel plan_status BEFORE update_user_subscription
+            # overwrites it below, so post-commit callbacks can still classify
+            # churn (trial vs paid) accurately. SQLAlchemy ignores
             # underscore-prefixed attributes for ORM persistence so this
             # rides along on the in-memory object only.
             user._prev_plan_status = user.plan_status
+
+            # Apply the Stripe payload the same way created/updated do
+            # (previously skipped here — confirmed via review 2026-09-20),
+            # so the ledger snapshot below reflects the actual cancellation
+            # moment (current_period_end, cancel_at_period_end) instead of
+            # stale values left over from whatever webhook last touched
+            # this user.
+            self.subscription_manager.update_user_subscription(user.id, subscription, commit=False)
+            user.plan_status = 'canceled'
+
             self._record_subscription_event(
                 user=user,
                 event_type='canceled',
-                stripe_subscription_id=subscription.get('id') or user.stripe_subscription_id,
+                stripe_subscription_id=subscription.get('id'),
                 plan_name=user.plan_name,
-                plan_status='canceled',
+                plan_status=user.plan_status,
                 current_period_start=user.current_period_start,
                 current_period_end=user.current_period_end,
-                cancel_at_period_end=True,
+                cancel_at_period_end=user.cancel_at_period_end,
                 commit=False,
             )
-            user.plan_status = 'canceled'
             user.stripe_subscription_id = None
             if commit:
                 self.db.session.commit()
@@ -557,6 +564,17 @@ class WebhookManager:
         No-ops if the caller never configured a subscription_event_model
         (default is skipped entirely, matching payment_model's pattern in
         _upsert_payment_record).
+
+        Unlike _upsert_payment_record, this is a plain INSERT with no
+        get-or-create dedup — that's intentional, not a gap. Redelivery of
+        the same Stripe event is already prevented upstream, in
+        _process_event_once's SELECT ... FOR UPDATE lock on
+        webhook_event_model.stripe_event_id: a retried event either finds
+        processed=True and short-circuits, or blocks on the row lock and
+        then does, before any handler (and therefore this method) runs.
+        Distinct Stripe events describing overlapping state (e.g.
+        created + updated seconds apart) are supposed to each get a row —
+        that's the point of a history ledger.
         """
         if not self.subscription_event_model:
             return
