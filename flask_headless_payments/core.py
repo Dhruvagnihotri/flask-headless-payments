@@ -404,7 +404,15 @@ class PaymentSvc:
             app,
             origins=cors_origins,
             supports_credentials=True,
-            allow_headers=['Content-Type', 'Authorization'],
+            # X-Request-ID: consuming apps' own frontends now send this on
+            # every request (see e.g. pdfwiz's apiClient.ts) so their
+            # backend's request-id-correlated logging picks it up here too,
+            # not just on their main app's own separately-registered CORS.
+            # Must be allow_headers'd (inbound, needs preflight permission)
+            # AND expose_headers'd (the response echo is otherwise hidden
+            # from cross-origin JS even though it's genuinely on the wire).
+            allow_headers=['Content-Type', 'Authorization', 'X-Requested-With', 'X-Request-ID'],
+            expose_headers=['X-Request-ID'],
             methods=['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
         )
         logger.info("CORS initialized for payments")
