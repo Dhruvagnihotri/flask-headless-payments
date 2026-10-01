@@ -81,6 +81,14 @@ class CheckoutManager:
                 if mode == 'subscription':
                     session_params['subscription_data'] = session_params.get('subscription_data', {})
                     session_params['subscription_data']['metadata'] = metadata
+                elif mode == 'payment':
+                    # Checkout Session metadata is NOT automatically copied onto
+                    # the PaymentIntent Stripe creates for a one-time payment -
+                    # that propagation only happens for subscription_data above.
+                    # Without this, _resolve_payment_user's metadata.user_id
+                    # fallback (webhook_manager.py) has nothing to read on the
+                    # PaymentIntent for a customerless/guest one-time purchase.
+                    session_params['payment_intent_data'] = {'metadata': metadata}
 
             create_kwargs = {}
             if idempotency_key:

@@ -598,6 +598,38 @@ class WebhookManager:
         )
         return event
 
+    def _resolve_payment_user(self, stripe_object: Dict[str, Any]) -> Optional[Any]:
+        """
+        Resolve the User a PaymentIntent/Invoice belongs to.
+
+        Tries the Stripe Customer chain first (works for anything with a
+        Customer attached, e.g. any subscription payment, or a one-time
+        payment created through CheckoutManager, which always attaches
+        one). Falls back to the object's own `metadata.user_id`, matching
+        the pattern consuming apps already use for checkout.session.completed
+        (see e.g. pdfwhiz's webhook_callbacks.py) — needed for a
+        customerless mode='payment' Checkout Session (a guest/one-time
+        purchase where the app deliberately never creates a Stripe
+        Customer), whose PaymentIntent has no `customer` field at all.
+        Returns None if neither resolves, which the caller must handle
+        without assuming a user exists (see _upsert_payment_record).
+        """
+        customer_id = stripe_object.get('customer')
+        if customer_id:
+            user = self.user_model.query.filter_by(stripe_customer_id=customer_id).first()
+            if user:
+                return user
+
+        metadata = stripe_object.get('metadata') or {}
+        raw_user_id = metadata.get('user_id')
+        if raw_user_id:
+            try:
+                return self.user_model.query.get(int(raw_user_id))
+            except (TypeError, ValueError):
+                logger.warning(f"metadata.user_id={raw_user_id!r} is not a valid id - ignoring")
+
+        return None
+
     def _upsert_payment_record(self, *, user, payment_intent_id, invoice_id, amount, currency,
                                 status, payment_method=None, receipt_url=None, description=None,
                                 commit=False):
@@ -649,10 +681,41 @@ class WebhookManager:
                 existing.receipt_url = receipt_url
             return existing
 
+        # Guard the INSERT path only (the update-existing-row path above
+        # already has a real user_id from whenever the row was first
+        # created, so it's never at risk here) — user_id is NOT NULL on
+        # both this package's own PaymentMixin and every consuming app's
+        # override seen so far. A customerless mode='payment' Checkout
+        # Session (a guest/one-time purchase with no Stripe Customer
+        # attached) has no `customer` field on its PaymentIntent at all,
+        # so the customer_id-based lookup in every caller above
+        # legitimately returns no user, and the metadata.user_id fallback
+        # (added alongside this fix) can also legitimately find nothing if
+        # the caller never set it. Previously this fell straight through to
+        # `user.id if user else None` below and threw a NOT NULL
+        # IntegrityError into Stripe's webhook delivery (500, infinite
+        # retry) — confirmed in production 2026-10-01, the first time this
+        # app ever ran a real mode='payment' purchase. The actual access
+        # grant is unaffected either way: that's handled by the app's own
+        # checkout.session.completed callback via session metadata, not
+        # this audit-log table. Skipping (rather than inserting a
+        # sentinel/placeholder user_id) is deliberate: this table is keyed
+        # for per-user payment history, so a row no one can ever be
+        # attributed to is worse than no row.
+        if user is None:
+            logger.warning(
+                f"Skipping Payment record for payment_intent={payment_intent_id!r} "
+                f"invoice={invoice_id!r} — no user could be resolved (no Stripe "
+                f"Customer attached and no metadata.user_id fallback matched). "
+                f"The access grant itself (if any) is handled separately via "
+                f"checkout.session.completed metadata, not this audit record."
+            )
+            return None
+
         payment = self.payment_model(
             stripe_payment_intent_id=payment_intent_id,
             stripe_invoice_id=invoice_id,
-            user_id=user.id if user else None,
+            user_id=user.id,
             amount=amount or 0,
             currency=currency or 'usd',
             status=status,
@@ -681,8 +744,7 @@ class WebhookManager:
         Returns:
             User object if found
         """
-        customer_id = invoice.get('customer')
-        user = self.user_model.query.filter_by(stripe_customer_id=customer_id).first() if customer_id else None
+        user = self._resolve_payment_user(invoice)
 
         self._upsert_payment_record(
             user=user,
@@ -713,8 +775,7 @@ class WebhookManager:
         Returns:
             User object if found
         """
-        customer_id = payment_intent.get('customer')
-        user = self.user_model.query.filter_by(stripe_customer_id=customer_id).first() if customer_id else None
+        user = self._resolve_payment_user(payment_intent)
 
         self._upsert_payment_record(
             user=user,
@@ -740,8 +801,7 @@ class WebhookManager:
         Returns:
             User object if found
         """
-        customer_id = invoice.get('customer')
-        user = self.user_model.query.filter_by(stripe_customer_id=customer_id).first() if customer_id else None
+        user = self._resolve_payment_user(invoice)
 
         self._upsert_payment_record(
             user=user,
