@@ -43,15 +43,18 @@ dependencies = [
     "Flask-JWT-Extended>=4.5.0",
     "Flask-CORS>=4.0.0",
     "stripe>=5.0.0",
-    "python-dotenv>=1.0.0",
     "Werkzeug>=2.0.0",
-    "marshmallow>=3.19.0",
-    "Flask-Migrate>=4.0.0",
-    "redis>=4.0.0",
-    "tenacity>=8.2.0",
 ]
 
 [project.optional-dependencies]
+# init_migrations() (migrations/__init__.py) is an opt-in helper for apps
+# that want Alembic-managed schema for this library's tables instead of
+# the default db.create_all() — not imported by the package's own
+# __init__.py, so it must be requested explicitly:
+# pip install flask-headless-payments[migrations]
+migrations = [
+    "Flask-Migrate>=4.0.0",
+]
 dev = [
     "pytest>=7.4.0",
     "pytest-cov>=4.1.0",

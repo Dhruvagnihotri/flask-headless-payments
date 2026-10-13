@@ -3,10 +3,10 @@ Flask-SQLAlchemy>=3.0.0
 Flask-JWT-Extended>=4.5.0
 Flask-CORS>=4.0.0
 stripe>=5.0.0
-python-dotenv>=1.0.0
 Werkzeug>=2.0.0
-marshmallow>=3.19.0
-Flask-Migrate>=4.0.0
-redis>=4.5.0
-tenacity>=8.2.0
+
+# Optional, only needed for migrations/__init__.py's opt-in init_migrations()
+# helper (Alembic-managed schema instead of the default db.create_all()) —
+# see pyproject.toml's [project.optional-dependencies].migrations extra.
+# Flask-Migrate>=4.0.0
 
